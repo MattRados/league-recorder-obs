@@ -1,0 +1,11 @@
+{
+  "name": "league-recorder-obs",
+  "private": true,
+  "description": "League Recorder's recorder and media tool, built on OBS Studio's libobs and FFmpeg (GPL-2.0)",
+  "license": "GPL-2.0-only",
+  "type": "module",
+  "scripts": {
+    "setup": "node scripts/fetch-obs.mjs && node scripts/fetch-obs-sdk.mjs && node scripts/fetch-ffmpeg-headers.mjs",
+    "build": "node scripts/build-native.mjs"
+  }
+}

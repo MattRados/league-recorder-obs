@@ -1,0 +1,981 @@
+// League Recorder's recorder: a small program built directly on OBS's core library (libobs), with
+// none of OBS's own interface. It records the League game with OBS's Game Capture, the chosen apps'
+// and mics' audio, and a hardware encoder, into a crash-safe (fragmented) MP4.
+//
+// League Recorder's core drives it over a Windows named pipe that rejects remote clients (no
+// network port). Tab-separated lines, newline-terminated, UTF-8:
+//   client -> recorder:  <id>\tsetup\t<json>                   (re)build scene, encoders, output; not while recording
+//                        <id>\tstatus                          -> res\t<id>\tok\t<0|1 recording>\t<0|1 game hooked>\t<0|1 replay buffer>
+//                        <id>\tstart\t<folder>\t<file name>    -> res\t<id>\tok   (then evt\tstarted)
+//                        <id>\tstop                            -> res\t<id>\tok   (then evt\tstopped\t<file>)
+//                        <id>\tbuffer-start\t<folder>\t<seconds>\t<max MB>  keep the last <seconds> in memory (then evt\tbuffer-started)
+//                        <id>\tbuffer-stop                     (then evt\tbuffer-stopped)
+//                        <id>\tclip                            save the buffer to <folder> (then evt\tclip\t<file>)
+//                        <id>\tvolume\t<source id>\t<level>    set an audio source's volume now (1 = as it plays), even while recording
+//                        <id>\tmeters\t<on|off>               report audio levels (evt\tlevels) ten times a second
+//                        <id>\tquit                            close cleanly
+//   recorder -> client:  evt\tstarted | evt\tstopped\t<file> (also if recording stops on its own)
+//                        evt\tbuffer-started | evt\tbuffer-stopped | evt\tclip\t<file>
+//                        evt\tlevels\t<source id>=<peak dB>\t...  (the loudest moment since the last report)
+//                        evt\thooked | evt\tunhooked             (Game Capture got into League, or lost it)
+//                        res\t<id>\terror\t<message>
+//
+// The replay buffer shares the recording's encoders: keeping the last seconds costs memory, not encoding.
+// Besides OBS's sources, setups can use "lr_app_audio" ({ exe }): an app's sound found by program name (below).
+// Audio inputs carry the core's source "id" (for volume and levels) and a "volume" (1 = as it plays).
+//
+// Command line: league-recorder-obs.exe --pipe <name> --config <folder for logs and plugin settings>
+// It lives in OBS's bin\64bit folder so libobs finds its data and plugins at ../../data and ../../obs-plugins.
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <audioclient.h>
+#include <audioclientactivationparams.h>
+#include <mmdeviceapi.h>
+#include <shellapi.h>
+#include <share.h>
+#include <tlhelp32.h>
+
+#include <obs.h>
+#include <util/base.h>
+#include <util/platform.h>
+
+#include <algorithm>
+#include <atomic>
+#include <memory>
+#include <cstdarg>
+#include <cstdio>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+// ---------- logging (added to the day file --log names, or <config>\recorder.log) ----------
+
+static FILE *log_file = nullptr;
+static std::mutex log_lock;
+
+static void log_handler(int level, const char *format, va_list args, void *)
+{
+	char message[8192];
+	vsnprintf(message, sizeof(message), format, args);
+	SYSTEMTIME t;
+	GetLocalTime(&t);
+	std::lock_guard<std::mutex> lock(log_lock);
+	if (!log_file)
+		return;
+	const char *tag = level <= LOG_ERROR ? "error: " : level <= LOG_WARNING ? "warning: " : "";
+	fprintf(log_file, "%02d:%02d:%02d.%03d: %s%s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, tag, message);
+	fflush(log_file);
+}
+
+// ---------- tasks libobs wants run on the "UI" (main) thread ----------
+
+static DWORD main_thread = 0;
+static const UINT WM_RUN_TASK = WM_APP + 1;
+
+struct UiTask {
+	obs_task_t task;
+	void *param;
+	HANDLE done; // set when finished, if the caller waits
+};
+
+static void ui_task_handler(obs_task_t task, void *param, bool wait)
+{
+	if (GetCurrentThreadId() == main_thread) {
+		task(param);
+		return;
+	}
+	auto *t = new UiTask{task, param, wait ? CreateEventW(nullptr, TRUE, FALSE, nullptr) : nullptr};
+	HANDLE done = t->done;
+	PostThreadMessageW(main_thread, WM_RUN_TASK, 0, reinterpret_cast<LPARAM>(t));
+	if (done) {
+		WaitForSingleObject(done, INFINITE);
+		CloseHandle(done);
+	}
+}
+
+// ---------- the pipe ----------
+
+static std::mutex write_lock;
+static HANDLE client = INVALID_HANDLE_VALUE;
+static std::atomic<bool> exiting{false};
+
+/** Send one line to the connected client, if any (from any thread). */
+static void send_line(const std::string &line)
+{
+	std::lock_guard<std::mutex> lock(write_lock);
+	if (client == INVALID_HANDLE_VALUE)
+		return;
+	std::string data = line + "\n";
+	OVERLAPPED ov{};
+	ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	DWORD written = 0;
+	if (WriteFile(client, data.data(), (DWORD)data.size(), nullptr, &ov) || GetLastError() == ERROR_IO_PENDING)
+		GetOverlappedResult(client, &ov, &written, TRUE);
+	CloseHandle(ov.hEvent);
+}
+
+static std::vector<std::string> split_tabs(const std::string &s, size_t max_parts = SIZE_MAX)
+{
+	std::vector<std::string> parts;
+	size_t start = 0;
+	for (;;) {
+		size_t tab = parts.size() + 1 >= max_parts ? std::string::npos : s.find('\t', start);
+		parts.push_back(s.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+		if (tab == std::string::npos)
+			return parts;
+		start = tab + 1;
+	}
+}
+
+// ---------- app audio by program name (source "lr_app_audio") ----------
+//
+// OBS's Application Audio Capture finds an app through a visible window, so it can't record apps
+// that have none: Riot's voice chat (RiotClientServices.exe) never shows one, and Discord hides its
+// window when minimized to the tray. This source finds the program by its exe name instead and
+// records it, with all its child processes, through Windows' process loopback (Windows 10 2004+).
+// It keeps looking while the app isn't running and picks it up again if it restarts.
+
+/** Receives the audio client once Windows has activated it */
+class ActivateHandler : public IActivateAudioInterfaceCompletionHandler, public IAgileObject {
+	LONG refs = 1;
+
+public:
+	HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	IAudioClient *client = nullptr;
+
+	~ActivateHandler() { CloseHandle(done); }
+	STDMETHODIMP QueryInterface(REFIID riid, void **out) override
+	{
+		if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler))
+			*out = static_cast<IActivateAudioInterfaceCompletionHandler *>(this);
+		else if (riid == __uuidof(IAgileObject))
+			*out = static_cast<IAgileObject *>(this);
+		else
+			return (*out = nullptr), E_NOINTERFACE;
+		AddRef();
+		return S_OK;
+	}
+	STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&refs); }
+	STDMETHODIMP_(ULONG) Release() override
+	{
+		ULONG n = InterlockedDecrement(&refs);
+		if (n == 0)
+			delete this;
+		return n;
+	}
+	STDMETHODIMP ActivateCompleted(IActivateAudioInterfaceAsyncOperation *op) override
+	{
+		HRESULT hr = E_FAIL;
+		IUnknown *unknown = nullptr;
+		if (SUCCEEDED(op->GetActivateResult(&hr, &unknown)) && SUCCEEDED(hr) && unknown) {
+			unknown->QueryInterface(__uuidof(IAudioClient), reinterpret_cast<void **>(&client));
+			unknown->Release();
+		}
+		SetEvent(done);
+		return S_OK;
+	}
+};
+
+/** The topmost running process with this exe name (its children are included in the capture) */
+static DWORD find_root_process(const std::wstring &exe)
+{
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE)
+		return 0;
+	std::vector<std::pair<DWORD, DWORD>> matches; // pid, parent
+	PROCESSENTRY32W e{sizeof(e)};
+	for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e))
+		if (_wcsicmp(e.szExeFile, exe.c_str()) == 0)
+			matches.push_back({e.th32ProcessID, e.th32ParentProcessID});
+	CloseHandle(snap);
+	for (auto &m : matches) {
+		bool parent_matches = false;
+		for (auto &other : matches)
+			parent_matches = parent_matches || other.first == m.second;
+		if (!parent_matches)
+			return m.first;
+	}
+	return matches.empty() ? 0 : matches[0].first;
+}
+
+struct AppAudio {
+	obs_source_t *source = nullptr;
+	std::wstring exe;
+	std::mutex lock; // guards exe
+	HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	HANDLE changed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	std::thread worker;
+
+	/** Record one run of the app until it exits, the target changes, or we're stopping */
+	void capture(DWORD pid, HANDLE process)
+	{
+		AUDIOCLIENT_ACTIVATION_PARAMS params = {};
+		params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+		params.ProcessLoopbackParams.TargetProcessId = pid;
+		params.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+		PROPVARIANT activation = {};
+		activation.vt = VT_BLOB;
+		activation.blob.cbSize = sizeof(params);
+		activation.blob.pBlobData = reinterpret_cast<BYTE *>(&params);
+
+		auto *handler = new ActivateHandler();
+		IActivateAudioInterfaceAsyncOperation *op = nullptr;
+		HRESULT hr = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, __uuidof(IAudioClient), &activation, handler, &op);
+		IAudioClient *client = nullptr;
+		if (SUCCEEDED(hr) && WaitForSingleObject(handler->done, 5000) == WAIT_OBJECT_0) {
+			client = handler->client;
+			handler->client = nullptr;
+		}
+		if (op)
+			op->Release();
+		handler->Release();
+		if (!client) {
+			blog(LOG_WARNING, "[recorder] app audio: couldn't capture %ls (pid %lu): 0x%08lx", exe.c_str(), pid, hr);
+			WaitForSingleObject(stop, 2000);
+			return;
+		}
+
+		WAVEFORMATEX format = {};
+		format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+		format.nChannels = 2;
+		format.nSamplesPerSec = 48000;
+		format.wBitsPerSample = 32;
+		format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
+		format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+		HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		IAudioCaptureClient *capture_client = nullptr;
+		hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 200000, 0,
+					&format, nullptr);
+		if (SUCCEEDED(hr))
+			hr = client->SetEventHandle(ready);
+		if (SUCCEEDED(hr))
+			hr = client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void **>(&capture_client));
+		if (SUCCEEDED(hr))
+			hr = client->Start();
+		if (FAILED(hr)) {
+			blog(LOG_WARNING, "[recorder] app audio: couldn't start capturing %ls: 0x%08lx", exe.c_str(), hr);
+		} else {
+			blog(LOG_INFO, "[recorder] app audio: capturing %ls (pid %lu)", exe.c_str(), pid);
+			HANDLE waits[] = {stop, changed, process, ready};
+			for (;;) {
+				DWORD w = WaitForMultipleObjects(4, waits, FALSE, 1000);
+				if (w == WAIT_OBJECT_0 || w == WAIT_OBJECT_0 + 1 || w == WAIT_OBJECT_0 + 2)
+					break; // stopping, a different app was set, or the app exited
+				UINT32 frames = 0;
+				while (SUCCEEDED(capture_client->GetNextPacketSize(&frames)) && frames > 0) {
+					BYTE *data = nullptr;
+					DWORD flags = 0;
+					if (FAILED(capture_client->GetBuffer(&data, &frames, &flags, nullptr, nullptr)))
+						break;
+					std::vector<float> silence;
+					if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+						silence.assign(frames * 2, 0.0f);
+						data = reinterpret_cast<BYTE *>(silence.data());
+					}
+					obs_source_audio audio = {};
+					audio.data[0] = data;
+					audio.frames = frames;
+					audio.speakers = SPEAKERS_STEREO;
+					audio.format = AUDIO_FORMAT_FLOAT;
+					audio.samples_per_sec = 48000;
+					audio.timestamp = os_gettime_ns() - util_mul_div64(frames, 1000000000ULL, 48000);
+					obs_source_output_audio(source, &audio);
+					capture_client->ReleaseBuffer(frames);
+				}
+			}
+			client->Stop();
+			blog(LOG_INFO, "[recorder] app audio: stopped capturing %ls", exe.c_str());
+		}
+		if (capture_client)
+			capture_client->Release();
+		client->Release();
+		CloseHandle(ready);
+	}
+
+	void run()
+	{
+		CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+		while (WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
+			std::wstring target;
+			{
+				std::lock_guard<std::mutex> l(lock);
+				target = exe;
+			}
+			ResetEvent(changed);
+			DWORD pid = target.empty() ? 0 : find_root_process(target);
+			HANDLE process = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
+			if (!process) {
+				// Not running: look again in a couple of seconds
+				HANDLE waits[] = {stop, changed};
+				WaitForMultipleObjects(2, waits, FALSE, 2000);
+				continue;
+			}
+			capture(pid, process);
+			CloseHandle(process);
+		}
+		CoUninitialize();
+	}
+
+	void update(obs_data_t *settings)
+	{
+		const char *name = obs_data_get_string(settings, "exe");
+		int n = MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0);
+		std::wstring w(n > 0 ? n - 1 : 0, L'\0');
+		if (n > 1)
+			MultiByteToWideChar(CP_UTF8, 0, name, -1, w.data(), n);
+		{
+			std::lock_guard<std::mutex> l(lock);
+			if (w == exe)
+				return;
+			exe = w;
+		}
+		SetEvent(changed);
+	}
+};
+
+static void register_app_audio_source()
+{
+	obs_source_info info = {};
+	info.id = "lr_app_audio";
+	info.type = OBS_SOURCE_TYPE_INPUT;
+	info.output_flags = OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE;
+	info.get_name = [](void *) -> const char * { return "App audio by program name"; };
+	info.create = [](obs_data_t *settings, obs_source_t *source) -> void * {
+		auto *a = new AppAudio();
+		a->source = source;
+		a->update(settings);
+		a->worker = std::thread([a] { a->run(); });
+		return a;
+	};
+	info.destroy = [](void *data) {
+		auto *a = static_cast<AppAudio *>(data);
+		SetEvent(a->stop);
+		if (a->worker.joinable())
+			a->worker.join();
+		CloseHandle(a->stop);
+		CloseHandle(a->changed);
+		delete a;
+	};
+	info.update = [](void *data, obs_data_t *settings) { static_cast<AppAudio *>(data)->update(settings); };
+	obs_register_source(&info);
+}
+
+// ---------- recording ----------
+
+static std::mutex obs_lock; // one command at a time
+static std::atomic<bool> hooked{false};
+
+struct Recording {
+	obs_scene_t *scene = nullptr;
+	obs_source_t *game = nullptr;
+	std::vector<obs_source_t *> audio; // on output channels 1..n
+	std::vector<std::string> audio_ids; // the core's id for each of them (volume, levels)
+	obs_encoder_t *video_encoder = nullptr;
+	std::vector<obs_encoder_t *> audio_encoders; // one per track
+	obs_output_t *output = nullptr;
+	obs_output_t *replay = nullptr; // the replay buffer, sharing the encoders above
+	std::string path;
+	std::string applied; // the setup JSON these were built from
+	uint32_t base_w = 0, base_h = 0, out_w = 0, out_h = 0, fps = 0;
+} rec;
+
+// ---------- audio levels (for the meters in Settings) ----------
+
+struct Meter {
+	std::string id;
+	obs_volmeter_t *volmeter = nullptr;
+	std::atomic<float> peak{-100.0f}; // loudest since the last report, dB
+};
+
+static std::mutex meters_lock;
+static std::vector<std::unique_ptr<Meter>> meters; // one per audio source, guarded by meters_lock
+static std::atomic<bool> metering{false};
+
+static void on_levels(void *param, const float[MAX_AUDIO_CHANNELS], const float peak[MAX_AUDIO_CHANNELS], const float[MAX_AUDIO_CHANNELS])
+{
+	auto *m = static_cast<Meter *>(param);
+	float top = std::max(peak[0], peak[1]);
+	float prev = m->peak.load();
+	while (top > prev && !m->peak.compare_exchange_weak(prev, top)) {
+	}
+}
+
+static void add_meter(const std::string &id, obs_source_t *source)
+{
+	auto m = std::make_unique<Meter>();
+	m->id = id;
+	m->volmeter = obs_volmeter_create(OBS_FADER_LOG);
+	obs_volmeter_attach_source(m->volmeter, source);
+	obs_volmeter_add_callback(m->volmeter, on_levels, m.get());
+	std::lock_guard<std::mutex> lock(meters_lock);
+	meters.push_back(std::move(m));
+}
+
+static void remove_meters()
+{
+	std::lock_guard<std::mutex> lock(meters_lock);
+	for (auto &m : meters) {
+		obs_volmeter_remove_callback(m->volmeter, on_levels, m.get());
+		obs_volmeter_destroy(m->volmeter);
+	}
+	meters.clear();
+}
+
+/** While metering is on: every source's loudest moment, ten times a second */
+static void report_levels()
+{
+	while (!exiting) {
+		Sleep(100);
+		if (!metering)
+			continue;
+		std::string line = "evt\tlevels";
+		{
+			std::lock_guard<std::mutex> lock(meters_lock);
+			for (auto &m : meters) {
+				float p = m->peak.exchange(-100.0f);
+				char field[32];
+				snprintf(field, sizeof(field), "=%.1f", p < -100.0f ? -100.0f : p);
+				line += "\t" + m->id + field;
+			}
+		}
+		send_line(line);
+	}
+}
+
+static void on_hooked(void *, calldata_t *)
+{
+	hooked = true;
+	send_line("evt\thooked");
+}
+
+static void on_unhooked(void *, calldata_t *)
+{
+	hooked = false;
+	send_line("evt\tunhooked");
+}
+
+static void on_output_start(void *, calldata_t *)
+{
+	send_line("evt\tstarted");
+}
+
+static void on_output_stop(void *, calldata_t *cd)
+{
+	long long code = calldata_int(cd, "code");
+	if (code != OBS_OUTPUT_SUCCESS)
+		blog(LOG_WARNING, "[recorder] recording stopped with code %lld: %s", code,
+		     rec.output ? (obs_output_get_last_error(rec.output) ? obs_output_get_last_error(rec.output) : "") : "");
+	send_line("evt\tstopped\t" + rec.path);
+}
+
+static void on_buffer_start(void *, calldata_t *)
+{
+	send_line("evt\tbuffer-started");
+}
+
+static void on_buffer_stop(void *, calldata_t *cd)
+{
+	long long code = calldata_int(cd, "code");
+	if (code != OBS_OUTPUT_SUCCESS)
+		blog(LOG_WARNING, "[recorder] replay buffer stopped with code %lld", code);
+	send_line("evt\tbuffer-stopped");
+}
+
+/** The buffer was written to a file: report where (OBS names it; the core renames it) */
+static void on_buffer_saved(void *, calldata_t *)
+{
+	std::string path;
+	if (rec.replay) {
+		calldata_t cd = {};
+		proc_handler_call(obs_output_get_proc_handler(rec.replay), "get_last_replay", &cd);
+		const char *p = calldata_string(&cd, "path");
+		if (p)
+			path = p;
+		calldata_free(&cd);
+	}
+	send_line("evt\tclip\t" + path);
+}
+
+static bool recording_active()
+{
+	return rec.output && obs_output_active(rec.output);
+}
+
+static bool buffer_active()
+{
+	return rec.replay && obs_output_active(rec.replay);
+}
+
+/** Release the scene, sources, encoders and outputs (not while recording or buffering). */
+static void teardown()
+{
+	if (rec.output) {
+		obs_output_release(rec.output);
+		rec.output = nullptr;
+	}
+	if (rec.replay) {
+		obs_output_release(rec.replay);
+		rec.replay = nullptr;
+	}
+	remove_meters();
+	if (rec.video_encoder) {
+		obs_encoder_release(rec.video_encoder);
+		rec.video_encoder = nullptr;
+	}
+	for (auto *enc : rec.audio_encoders)
+		obs_encoder_release(enc);
+	rec.audio_encoders.clear();
+	for (uint32_t ch = 0; ch < MAX_CHANNELS; ch++)
+		obs_set_output_source(ch, nullptr);
+	for (auto *src : rec.audio)
+		obs_source_release(src);
+	rec.audio.clear();
+	rec.audio_ids.clear();
+	if (rec.game) {
+		obs_source_release(rec.game);
+		rec.game = nullptr;
+	}
+	if (rec.scene) {
+		obs_scene_release(rec.scene);
+		rec.scene = nullptr;
+	}
+	hooked = false;
+	rec.applied.clear();
+}
+
+static bool reset_video(uint32_t base_w, uint32_t base_h, uint32_t out_w, uint32_t out_h, uint32_t fps)
+{
+	obs_video_info ovi = {};
+	ovi.graphics_module = "libobs-d3d11.dll";
+	ovi.fps_num = fps;
+	ovi.fps_den = 1;
+	ovi.base_width = base_w;
+	ovi.base_height = base_h;
+	ovi.output_width = out_w;
+	ovi.output_height = out_h;
+	ovi.output_format = VIDEO_FORMAT_NV12;
+	ovi.colorspace = VIDEO_CS_709;
+	ovi.range = VIDEO_RANGE_PARTIAL;
+	ovi.adapter = 0;
+	ovi.gpu_conversion = true;
+	ovi.scale_type = OBS_SCALE_BICUBIC;
+	int result = obs_reset_video(&ovi);
+	if (result != OBS_VIDEO_SUCCESS) {
+		blog(LOG_ERROR, "[recorder] obs_reset_video failed: %d", result);
+		return false;
+	}
+	rec.base_w = base_w;
+	rec.base_h = base_h;
+	rec.out_w = out_w;
+	rec.out_h = out_h;
+	rec.fps = fps;
+	return true;
+}
+
+/**
+ * Build everything from the core's setup: canvas and output size, frame rate, the Game Capture
+ * source and audio sources (with their track mixers), the video encoder and its settings, one AAC
+ * encoder per audio track, and the MP4 output.
+ */
+static std::string apply_setup(const std::string &json)
+{
+	if (recording_active() || buffer_active())
+		return "Can't change the setup while recording";
+	if (json == rec.applied)
+		return "";
+	obs_data_t *setup = obs_data_create_from_json(json.c_str());
+	if (!setup)
+		return "Bad setup";
+	teardown();
+
+	obs_data_t *base = obs_data_get_obj(setup, "base");
+	obs_data_t *out = obs_data_get_obj(setup, "out");
+	uint32_t bw = (uint32_t)obs_data_get_int(base, "w"), bh = (uint32_t)obs_data_get_int(base, "h");
+	uint32_t ow = (uint32_t)obs_data_get_int(out, "w"), oh = (uint32_t)obs_data_get_int(out, "h");
+	uint32_t fps = (uint32_t)obs_data_get_int(setup, "fps");
+	obs_data_release(base);
+	obs_data_release(out);
+	std::string error;
+	if (bw != rec.base_w || bh != rec.base_h || ow != rec.out_w || oh != rec.out_h || fps != rec.fps) {
+		if (!reset_video(bw, bh, ow, oh, fps)) {
+			obs_data_release(setup);
+			return "The video settings couldn't be applied";
+		}
+	}
+
+	rec.scene = obs_scene_create_private("Game");
+	obs_data_array_t *inputs = obs_data_get_array(setup, "inputs");
+	size_t count = obs_data_array_count(inputs);
+	uint32_t channel = 1; // 0 is the scene; audio sources take 1, 2, ...
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *input = obs_data_array_item(inputs, i);
+		const char *kind = obs_data_get_string(input, "kind");
+		const char *name = obs_data_get_string(input, "name");
+		obs_data_t *settings = obs_data_get_obj(input, "settings");
+		obs_source_t *source = obs_source_create_private(kind, name, settings);
+		obs_data_release(settings);
+		if (!source) {
+			blog(LOG_WARNING, "[recorder] couldn't create %s '%s'", kind, name);
+		} else if (strcmp(kind, "game_capture") == 0) {
+			rec.game = source;
+			obs_sceneitem_t *item = obs_scene_add(rec.scene, source);
+			// Scale Game Capture to fit the canvas, whatever size League's window is
+			vec2 bounds;
+			vec2_set(&bounds, (float)bw, (float)bh);
+			obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_SCALE_INNER);
+			obs_sceneitem_set_bounds(item, &bounds);
+			obs_sceneitem_set_bounds_alignment(item, OBS_ALIGN_CENTER);
+			signal_handler_t *signals = obs_source_get_signal_handler(source);
+			signal_handler_connect(signals, "hooked", on_hooked, nullptr);
+			signal_handler_connect(signals, "unhooked", on_unhooked, nullptr);
+		} else if (channel < MAX_CHANNELS) {
+			obs_source_set_audio_mixers(source, (uint32_t)obs_data_get_int(input, "mixers"));
+			obs_source_set_volume(source, obs_data_has_user_value(input, "volume") ? (float)obs_data_get_double(input, "volume") : 1.0f);
+			obs_set_output_source(channel++, source);
+			rec.audio.push_back(source);
+			rec.audio_ids.push_back(obs_data_get_string(input, "id"));
+			add_meter(rec.audio_ids.back(), source);
+		} else {
+			obs_source_release(source);
+		}
+		obs_data_release(input);
+	}
+	obs_data_array_release(inputs);
+	obs_set_output_source(0, obs_scene_get_source(rec.scene));
+
+	obs_data_t *encoder_settings = obs_data_get_obj(setup, "encoderSettings");
+	rec.video_encoder = obs_video_encoder_create(obs_data_get_string(setup, "encoder"), "video", encoder_settings, nullptr);
+	obs_data_release(encoder_settings);
+	if (!rec.video_encoder)
+		error = std::string("The encoder couldn't be created: ") + obs_data_get_string(setup, "encoder");
+	else
+		obs_encoder_set_video(rec.video_encoder, obs_get_video());
+
+	// Tracks: one AAC encoder per track bit (track 1 = the full mix)
+	uint32_t tracks = (uint32_t)obs_data_get_int(setup, "recTracks");
+	obs_data_t *aac = obs_data_create();
+	obs_data_set_int(aac, "bitrate", 192);
+	for (uint32_t i = 0; i < MAX_AUDIO_MIXES; i++) {
+		if (!(tracks & (1u << i)))
+			continue;
+		std::string name = "audio" + std::to_string(i + 1);
+		obs_encoder_t *enc = obs_audio_encoder_create("ffmpeg_aac", name.c_str(), aac, i, nullptr);
+		if (enc) {
+			obs_encoder_set_audio(enc, obs_get_audio());
+			rec.audio_encoders.push_back(enc);
+		}
+	}
+	obs_data_release(aac);
+
+	rec.output = obs_output_create("ffmpeg_muxer", "record", nullptr, nullptr);
+	if (rec.output) {
+		if (rec.video_encoder)
+			obs_output_set_video_encoder(rec.output, rec.video_encoder);
+		for (size_t i = 0; i < rec.audio_encoders.size(); i++)
+			obs_output_set_audio_encoder(rec.output, rec.audio_encoders[i], i);
+		signal_handler_t *signals = obs_output_get_signal_handler(rec.output);
+		signal_handler_connect(signals, "start", on_output_start, nullptr);
+		signal_handler_connect(signals, "stop", on_output_stop, nullptr);
+	} else {
+		error = "The recording output couldn't be created";
+	}
+
+	rec.replay = obs_output_create("replay_buffer", "replay", nullptr, nullptr);
+	if (rec.replay) {
+		if (rec.video_encoder)
+			obs_output_set_video_encoder(rec.replay, rec.video_encoder);
+		for (size_t i = 0; i < rec.audio_encoders.size(); i++)
+			obs_output_set_audio_encoder(rec.replay, rec.audio_encoders[i], i);
+		signal_handler_t *signals = obs_output_get_signal_handler(rec.replay);
+		signal_handler_connect(signals, "start", on_buffer_start, nullptr);
+		signal_handler_connect(signals, "stop", on_buffer_stop, nullptr);
+		signal_handler_connect(signals, "saved", on_buffer_saved, nullptr);
+	} else {
+		blog(LOG_WARNING, "[recorder] the replay buffer couldn't be created; clips won't work");
+	}
+	obs_data_release(setup);
+	if (error.empty())
+		rec.applied = json;
+	blog(LOG_INFO, "[recorder] setup applied: %ux%u -> %ux%u @ %u fps, %zu audio sources, %zu tracks", bw, bh, ow, oh, fps,
+	     rec.audio.size(), rec.audio_encoders.size());
+	return error;
+}
+
+static std::string start_recording(const std::string &folder, const std::string &name)
+{
+	if (!rec.output || rec.applied.empty())
+		return "The recorder isn't set up yet";
+	if (recording_active())
+		return "Already recording";
+	rec.path = folder + "/" + name + ".mp4";
+	obs_data_t *settings = obs_data_create();
+	obs_data_set_string(settings, "path", rec.path.c_str());
+	// Fragmented MP4, as OBS does it: playable even if the recording is cut off by a crash
+	obs_data_set_string(settings, "muxer_settings", "movflags=frag_keyframe+empty_moov+delay_moov");
+	obs_output_update(rec.output, settings);
+	obs_data_release(settings);
+	if (!obs_output_start(rec.output)) {
+		const char *why = obs_output_get_last_error(rec.output);
+		return std::string("Recording didn't start") + (why ? std::string(": ") + why : "");
+	}
+	return "";
+}
+
+static std::string start_buffer(const std::string &folder, int seconds, int max_mb)
+{
+	if (!rec.replay || rec.applied.empty())
+		return "The recorder isn't set up yet";
+	if (buffer_active())
+		return "";
+	obs_data_t *settings = obs_data_create();
+	obs_data_set_string(settings, "directory", folder.c_str());
+	obs_data_set_string(settings, "format", "Clip %CCYY-%MM-%DD_%hh-%mm-%ss");
+	obs_data_set_string(settings, "extension", "mp4");
+	obs_data_set_bool(settings, "allow_spaces", true);
+	obs_data_set_int(settings, "max_time_sec", seconds);
+	obs_data_set_int(settings, "max_size_mb", max_mb);
+	obs_output_update(rec.replay, settings);
+	obs_data_release(settings);
+	if (!obs_output_start(rec.replay)) {
+		const char *why = obs_output_get_last_error(rec.replay);
+		return std::string("The clip buffer didn't start") + (why ? std::string(": ") + why : "");
+	}
+	return "";
+}
+
+static std::string save_clip()
+{
+	if (!buffer_active())
+		return "The clip buffer isn't running";
+	calldata_t cd = {};
+	proc_handler_call(obs_output_get_proc_handler(rec.replay), "save", &cd);
+	calldata_free(&cd);
+	return "";
+}
+
+static void handle_line(const std::string &line)
+{
+	std::vector<std::string> head = split_tabs(line, 3);
+	if (head.size() < 2)
+		return;
+	const std::string &id = head[0], &cmd = head[1];
+	std::string error;
+	std::string extra;
+	{
+		std::lock_guard<std::mutex> lock(obs_lock);
+		if (cmd == "setup" && head.size() >= 3) {
+			error = apply_setup(head[2]);
+		} else if (cmd == "status") {
+			extra = std::string("\t") + (recording_active() ? "1" : "0") + "\t" + (hooked ? "1" : "0") + "\t" + (buffer_active() ? "1" : "0");
+		} else if (cmd == "start" && head.size() >= 3) {
+			std::vector<std::string> args = split_tabs(head[2]);
+			error = args.size() >= 2 ? start_recording(args[0], args[1]) : "start needs a folder and a name";
+		} else if (cmd == "stop") {
+			if (recording_active())
+				obs_output_stop(rec.output);
+			else
+				error = "Not recording";
+		} else if (cmd == "buffer-start" && head.size() >= 3) {
+			std::vector<std::string> args = split_tabs(head[2]);
+			error = args.size() >= 3 ? start_buffer(args[0], atoi(args[1].c_str()), atoi(args[2].c_str()))
+						 : "buffer-start needs a folder, seconds and a size";
+		} else if (cmd == "buffer-stop") {
+			if (buffer_active())
+				obs_output_stop(rec.replay);
+		} else if (cmd == "clip") {
+			error = save_clip();
+		} else if (cmd == "volume" && head.size() >= 3) {
+			std::vector<std::string> args = split_tabs(head[2]);
+			bool found = false;
+			for (size_t i = 0; args.size() >= 2 && i < rec.audio_ids.size(); i++) {
+				if (rec.audio_ids[i] == args[0]) {
+					obs_source_set_volume(rec.audio[i], (float)atof(args[1].c_str()));
+					found = true;
+				}
+			}
+			if (!found)
+				error = "No such audio source";
+		} else if (cmd == "meters" && head.size() >= 3) {
+			metering = head[2] == "on";
+		} else if (cmd == "quit") {
+			exiting = true;
+			PostThreadMessageW(main_thread, WM_QUIT, 0, 0);
+		} else {
+			error = "Unknown command " + cmd;
+		}
+	}
+	send_line(error.empty() ? "res\t" + id + "\tok" + extra : "res\t" + id + "\terror\t" + error);
+}
+
+static void serve(std::wstring name)
+{
+	while (!exiting) {
+		HANDLE pipe = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+					       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
+					       64 * 1024, 64 * 1024, 0, nullptr);
+		if (pipe == INVALID_HANDLE_VALUE) {
+			blog(LOG_WARNING, "[recorder] CreateNamedPipe failed: %lu", GetLastError());
+			Sleep(1000);
+			continue;
+		}
+		OVERLAPPED ov{};
+		ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		bool connected = ConnectNamedPipe(pipe, &ov) != FALSE;
+		if (!connected) {
+			DWORD err = GetLastError();
+			if (err == ERROR_IO_PENDING) {
+				DWORD ignored;
+				connected = GetOverlappedResult(pipe, &ov, &ignored, TRUE) != FALSE;
+			} else {
+				connected = err == ERROR_PIPE_CONNECTED;
+			}
+		}
+		if (connected) {
+			{
+				std::lock_guard<std::mutex> lock(write_lock);
+				client = pipe;
+			}
+			std::string buffer;
+			char chunk[16384];
+			for (;;) {
+				ResetEvent(ov.hEvent);
+				DWORD n = 0;
+				if (!ReadFile(pipe, chunk, sizeof(chunk), nullptr, &ov) && GetLastError() != ERROR_IO_PENDING)
+					break;
+				if (!GetOverlappedResult(pipe, &ov, &n, TRUE) || n == 0)
+					break;
+				buffer.append(chunk, n);
+				size_t nl;
+				while ((nl = buffer.find('\n')) != std::string::npos) {
+					std::string line = buffer.substr(0, nl);
+					buffer.erase(0, nl + 1);
+					if (!line.empty() && line.back() == '\r')
+						line.pop_back();
+					handle_line(line);
+				}
+			}
+			std::lock_guard<std::mutex> lock(write_lock);
+			client = INVALID_HANDLE_VALUE;
+		}
+		DisconnectNamedPipe(pipe);
+		CloseHandle(ov.hEvent);
+		CloseHandle(pipe);
+	}
+}
+
+// ---------- startup ----------
+
+static std::string utf8(const std::wstring &w)
+{
+	int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+	std::string s(n > 0 ? n - 1 : 0, '\0');
+	if (n > 1)
+		WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+	return s;
+}
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
+{
+	SetErrorMode(SEM_FAILCRITICALERRORS);
+	// libobs finds its data and plugins relative to the working folder (../../data, ../../obs-plugins)
+	wchar_t exe_path[MAX_PATH];
+	DWORD len = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+	if (len > 0 && len < MAX_PATH) {
+		wchar_t *slash = wcsrchr(exe_path, L'\\');
+		if (slash) {
+			*slash = L'\0';
+			SetCurrentDirectoryW(exe_path);
+		}
+	}
+	main_thread = GetCurrentThreadId();
+	MSG msg;
+	PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE); // create this thread's message queue
+
+	std::wstring pipe_name = L"league-recorder-obs";
+	std::wstring config;
+	std::wstring log_path;
+	int argc = 0;
+	LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	for (int i = 1; i + 1 < argc; i++) {
+		if (wcscmp(argv[i], L"--pipe") == 0)
+			pipe_name = argv[++i];
+		else if (wcscmp(argv[i], L"--config") == 0)
+			config = argv[++i];
+		else if (wcscmp(argv[i], L"--log") == 0)
+			log_path = argv[++i];
+	}
+	LocalFree(argv);
+	if (config.empty()) {
+		wchar_t temp[MAX_PATH];
+		GetTempPathW(MAX_PATH, temp);
+		config = std::wstring(temp) + L"league-recorder-obs";
+	}
+	CreateDirectoryW(config.c_str(), nullptr);
+	// Shared, so the log can be read while the recorder runs. The day file the app passes is added to
+	// (the app keeps a week of them); without one, the old single file is started afresh.
+	if (!log_path.empty())
+		log_file = _wfsopen(log_path.c_str(), L"a", _SH_DENYNO);
+	if (!log_file)
+		log_file = _wfsopen((config + L"\\recorder.log").c_str(), L"w", _SH_DENYNO);
+	base_set_log_handler(log_handler, nullptr);
+	blog(LOG_INFO, "---- recorder started (pid %lu) ----", GetCurrentProcessId());
+
+	std::string plugin_config = utf8(config) + "/plugin_config";
+	if (!obs_startup("en-US", plugin_config.c_str(), nullptr)) {
+		blog(LOG_ERROR, "[recorder] obs_startup failed");
+		return 1;
+	}
+	obs_set_ui_task_handler(ui_task_handler);
+
+	obs_audio_info oai = {};
+	oai.samples_per_sec = 48000;
+	oai.speakers = SPEAKERS_STEREO;
+	if (!obs_reset_audio(&oai)) {
+		blog(LOG_ERROR, "[recorder] obs_reset_audio failed");
+		obs_shutdown();
+		return 1;
+	}
+	// A placeholder canvas until the first setup arrives (plugins load against a running renderer)
+	if (!reset_video(1920, 1080, 1920, 1080, 60)) {
+		obs_shutdown();
+		return 1;
+	}
+	obs_load_all_modules();
+	obs_log_loaded_modules();
+	obs_post_load_modules();
+	register_app_audio_source();
+
+	std::thread(serve, L"\\\\.\\pipe\\" + pipe_name).detach();
+	std::thread(report_levels).detach();
+	blog(LOG_INFO, "[recorder] ready");
+
+	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+		if (msg.message == WM_RUN_TASK) {
+			auto *t = reinterpret_cast<UiTask *>(msg.lParam);
+			t->task(t->param);
+			if (t->done)
+				SetEvent(t->done);
+			delete t;
+		} else {
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+	}
+
+	exiting = true;
+	{
+		std::lock_guard<std::mutex> lock(obs_lock);
+		if (recording_active())
+			obs_output_force_stop(rec.output);
+		if (buffer_active())
+			obs_output_force_stop(rec.replay);
+		teardown();
+	}
+	obs_shutdown();
+	blog(LOG_INFO, "[recorder] closed");
+	if (log_file)
+		fclose(log_file);
+	return 0;
+}
