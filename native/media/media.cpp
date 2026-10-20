@@ -35,6 +35,7 @@ extern "C" {
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <string>
 #include <vector>
@@ -612,8 +613,12 @@ static void run_thumbnail(const std::string &in_path, const std::string &out_pat
 }
 
 // The pixels of one area of the frame at each of the given times, as RGB (3 bytes a pixel, rows top to
-// bottom), one after another in <out>: for reading the game's HUD after a game (ability letters).
-// Each time is found like a thumbnail's: the latest frame at or before it.
+// bottom), one after another in <out> in the order asked: for reading the game's HUD after a game
+// (ability letters). Each time is found like a thumbnail's: the latest frame at or before it.
+// The times are read in order in one pass forward. Seeking to each one decoded from the keyframe
+// before it every time (up to 2 s of video), even when the last time was a second earlier in the
+// same stretch; now it only seeks when a keyframe lies between the last frame and the next time,
+// so no frame is decoded twice. The frames picked are the same ones.
 static void run_pixels(const std::string &in_path, const std::string &out_path, int x, int y, int w, int h, const std::vector<double> &times)
 {
 	Input in(in_path);
@@ -630,7 +635,7 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 	if (!codec)
 		throw Failure{"No decoder for this video"};
 	AVCodecContext *dec = avcodec_alloc_context3(codec);
-	AVFrame *frame = av_frame_alloc(), *picked = av_frame_alloc(), *rgb = av_frame_alloc();
+	AVFrame *frame = av_frame_alloc(), *picked = av_frame_alloc(), *ahead = av_frame_alloc(), *rgb = av_frame_alloc();
 	AVPacket *pkt = av_packet_alloc();
 	SwsContext *sws = nullptr;
 	FILE *file = nullptr;
@@ -641,50 +646,118 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 		avcodec_free_context(&dec);
 		av_frame_free(&frame);
 		av_frame_free(&picked);
+		av_frame_free(&ahead);
 		av_frame_free(&rgb);
 		av_packet_free(&pkt);
 	};
 	try {
 		check(avcodec_parameters_to_context(dec, vs->codecpar), "Couldn't read the video");
 		dec->pkt_timebase = vs->time_base;
-		dec->thread_count = 0; // as many as the CPU has: each seek decodes up to a keyframe interval
+		dec->thread_count = 0; // as many as the CPU has
 		check(avcodec_open2(dec, codec, nullptr), "Couldn't open the video decoder");
 		if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > dec->width || y + h > dec->height)
 			throw Failure{"The area is outside the picture"};
 		file = _wfopen(wide(out_path).c_str(), L"wb");
 		if (!file)
 			throw Failure{"Couldn't write the pixels"};
-		std::vector<uint8_t> row((size_t)w * 3);
+		const size_t row = (size_t)w * 3;
 
-		int64_t start = vs->start_time == AV_NOPTS_VALUE ? 0 : vs->start_time;
-		for (size_t n = 0; n < times.size(); n++) {
-			int64_t target = start + (int64_t)(times[n] / av_q2d(vs->time_base));
-			avcodec_flush_buffers(dec);
-			av_seek_frame(in.ctx, in.video, target, AVSEEK_FLAG_BACKWARD);
-			bool have = false, done = false;
-			auto take = [&]() {
-				while (!done && avcodec_receive_frame(dec, frame) >= 0) {
-					// The latest frame up to the target, as for thumbnails
-					if (have && frame->best_effort_timestamp != AV_NOPTS_VALUE && frame->best_effort_timestamp > target) {
-						done = true;
-						av_frame_unref(frame);
-						break;
-					}
-					av_frame_unref(picked);
-					av_frame_move_ref(picked, frame);
-					have = true;
-					if (picked->best_effort_timestamp != AV_NOPTS_VALUE && picked->best_effort_timestamp >= target)
-						done = true;
+		// The times in order (the HUD reader asks fight by fight, which can overlap); the areas are
+		// written out in the order asked
+		std::vector<size_t> order(times.size());
+		for (size_t n = 0; n < order.size(); n++)
+			order[n] = n;
+		std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return times[a] < times[b]; });
+		std::vector<uint8_t> areas(times.size() * row * h);
+
+		// `picked`: the newest frame decoded at or before the time being read; `ahead`: the first one
+		// decoded after it, kept for the next time
+		bool have = false, have_ahead = false, drained = false;
+		int64_t target = 0;
+		// Frames nothing else refers to (most B-frames) aren't decoded when a later frame at or before
+		// the target has been sent already: they can't be the one picked. `latest`: the newest such time
+		// sent; `later`: times sent that were past the target then
+		int64_t latest = AV_NOPTS_VALUE;
+		std::vector<int64_t> later;
+		auto next = [&](AVFrame *into) {
+			for (;;) {
+				int r = avcodec_receive_frame(dec, into);
+				if (r >= 0)
+					return true;
+				if (r != AVERROR(EAGAIN) || drained)
+					return false;
+				if (av_read_frame(in.ctx, pkt) < 0) {
+					// The end: what the decoder still holds
+					avcodec_send_packet(dec, nullptr);
+					drained = true;
+					continue;
 				}
-			};
-			while (!done && av_read_frame(in.ctx, pkt) >= 0) {
-				if (pkt->stream_index == in.video && avcodec_send_packet(dec, pkt) >= 0)
-					take();
+				if (pkt->stream_index == in.video) {
+					bool skippable = pkt->pts != AV_NOPTS_VALUE && latest != AV_NOPTS_VALUE && pkt->pts < latest;
+					dec->skip_frame = skippable ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+					if (avcodec_send_packet(dec, pkt) >= 0 && pkt->pts != AV_NOPTS_VALUE) {
+						if (pkt->pts <= target)
+							latest = latest == AV_NOPTS_VALUE ? pkt->pts : std::max(latest, pkt->pts);
+						else
+							later.push_back(pkt->pts);
+					}
+				}
 				av_packet_unref(pkt);
 			}
-			if (!done) {
-				avcodec_send_packet(dec, nullptr);
-				take();
+		};
+
+		int64_t start = vs->start_time == AV_NOPTS_VALUE ? 0 : vs->start_time;
+		for (size_t done_count = 0; done_count < order.size(); done_count++) {
+			size_t n = order[done_count];
+			target = start + (int64_t)(times[n] / av_q2d(vs->time_base));
+
+			// Jump only if a keyframe lies after the frame we're at, on the way to the target: decoding
+			// from there is shorter. Without a keyframe list, jump for gaps over 2 s
+			bool seek = !have || picked->best_effort_timestamp == AV_NOPTS_VALUE;
+			if (!seek) {
+				int64_t at = picked->best_effort_timestamp;
+				const AVIndexEntry *key = avformat_index_get_entry_from_timestamp(vs, target, AVSEEK_FLAG_BACKWARD);
+				seek = key ? key->timestamp > at : (target - at) * av_q2d(vs->time_base) > 2;
+			}
+			if (seek) {
+				avcodec_flush_buffers(dec);
+				av_seek_frame(in.ctx, in.video, target, AVSEEK_FLAG_BACKWARD);
+				av_frame_unref(picked);
+				av_frame_unref(ahead);
+				have = have_ahead = drained = false;
+				latest = AV_NOPTS_VALUE;
+				later.clear();
+			}
+			// Times sent earlier that this target has reached
+			for (size_t i = 0; i < later.size();) {
+				if (later[i] <= target) {
+					latest = latest == AV_NOPTS_VALUE ? later[i] : std::max(latest, later[i]);
+					later.erase(later.begin() + i);
+				} else {
+					i++;
+				}
+			}
+
+			// Forward to the target: the first frame after a jump is taken whatever its time; after
+			// that, frames up to the target, stopping at one past it
+			bool done = have && picked->best_effort_timestamp != AV_NOPTS_VALUE && picked->best_effort_timestamp >= target;
+			while (!done) {
+				if (have_ahead) {
+					av_frame_unref(frame);
+					av_frame_move_ref(frame, ahead);
+					have_ahead = false;
+				} else if (!next(frame)) {
+					break; // past the end: keep the last frame decoded
+				}
+				if (have && frame->best_effort_timestamp != AV_NOPTS_VALUE && frame->best_effort_timestamp > target) {
+					av_frame_move_ref(ahead, frame);
+					have_ahead = true;
+					break;
+				}
+				av_frame_unref(picked);
+				av_frame_move_ref(picked, frame);
+				have = true;
+				done = picked->best_effort_timestamp != AV_NOPTS_VALUE && picked->best_effort_timestamp >= target;
 			}
 			if (!have)
 				throw Failure{"No frame could be decoded"};
@@ -703,10 +776,11 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 			}
 			sws_scale(sws, picked->data, picked->linesize, 0, picked->height, rgb->data, rgb->linesize);
 			for (int r = 0; r < h; r++)
-				if (fwrite(rgb->data[0] + (size_t)(y + r) * rgb->linesize[0] + (size_t)x * 3, 1, row.size(), file) != row.size())
-					throw Failure{"Couldn't write the pixels"};
-			say("progress " + std::to_string((double)(n + 1) / times.size()));
+				memcpy(&areas[(n * h + r) * row], rgb->data[0] + (size_t)(y + r) * rgb->linesize[0] + (size_t)x * 3, row);
+			say("progress " + std::to_string((double)(done_count + 1) / times.size()));
 		}
+		if (!areas.empty() && fwrite(areas.data(), 1, areas.size(), file) != areas.size())
+			throw Failure{"Couldn't write the pixels"};
 	} catch (...) {
 		cleanup();
 		throw;
