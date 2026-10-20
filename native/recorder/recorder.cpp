@@ -865,6 +865,138 @@ static void serve(std::wstring name)
 	}
 }
 
+// ---------- crashes ----------
+//
+// What a crash leaves in the log, so it says where it happened and not only that the log stopped: the
+// exception, the module and offset it happened at, and the call stack as module+offset (there are no
+// symbols here; offsets can be matched up with the build later). The app's window process copies these
+// "[crash]" lines into the crash log, next to the app's own crashes (crash.rs). A fail-fast (0xC0000409)
+// ends the process without running any of this: then the exit code, which the window's process reads,
+// is all there is.
+
+/** One "[crash]" line straight to the log: no lock another thread may be holding, no allocations */
+static void crash_line(const char *format, ...)
+{
+	if (!log_file)
+		return;
+	char text[512];
+	va_list args;
+	va_start(args, format);
+	vsnprintf(text, sizeof(text), format, args);
+	va_end(args);
+	SYSTEMTIME t;
+	GetLocalTime(&t);
+	char line[600];
+	int n = snprintf(line, sizeof(line), "%02d:%02d:%02d.%03d: [crash] %s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, text);
+	if (n <= 0)
+		return;
+	_fwrite_nolock(line, 1, n < (int)sizeof(line) ? (size_t)n : sizeof(line) - 1, log_file);
+	_fflush_nolock(log_file);
+}
+
+/** The module (DLL or exe) an address is in, and how far into it */
+static void module_at(DWORD64 address, char *name, size_t size, DWORD64 *offset)
+{
+	HMODULE module = nullptr;
+	char path[MAX_PATH];
+	DWORD n = 0;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)address, &module) && module)
+		n = GetModuleFileNameA(module, path, MAX_PATH);
+	if (!n || n >= MAX_PATH) {
+		snprintf(name, size, "?");
+		*offset = address;
+		return;
+	}
+	const char *file = path;
+	for (DWORD i = 0; i < n; i++)
+		if (path[i] == '\\' || path[i] == '/')
+			file = path + i + 1;
+	snprintf(name, size, "%s", file);
+	*offset = address - (DWORD64)module;
+}
+
+/** One step up the call stack (x64 unwind data); false at its end, or when the stack can't be read */
+static bool unwind(CONTEXT *ctx)
+{
+	__try {
+		DWORD64 base = 0;
+		PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx->Rip, &base, nullptr);
+		if (fn) {
+			void *handler = nullptr;
+			DWORD64 frame = 0;
+			RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx->Rip, fn, ctx, &handler, &frame, nullptr);
+		} else {
+			// A function that calls nothing: the return address is on top of the stack
+			ctx->Rip = *(DWORD64 *)ctx->Rsp;
+			ctx->Rsp += 8;
+		}
+		return ctx->Rip != 0;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
+static const char *exception_name(DWORD code)
+{
+	switch (code) {
+	case EXCEPTION_ACCESS_VIOLATION:
+		return "memory access violation";
+	case EXCEPTION_STACK_OVERFLOW:
+		return "stack overflow";
+	case EXCEPTION_ILLEGAL_INSTRUCTION:
+		return "illegal instruction";
+	case EXCEPTION_INT_DIVIDE_BY_ZERO:
+		return "divide by zero";
+	case EXCEPTION_IN_PAGE_ERROR:
+		return "couldn't read a file it had mapped";
+	case EXCEPTION_BREAKPOINT:
+		return "breakpoint";
+	case 0xC0000374:
+		return "heap corruption";
+	case 0xE06D7363:
+		return "C++ exception nothing caught";
+	default:
+		return "unexpected exception";
+	}
+}
+
+static LONG WINAPI on_crash(EXCEPTION_POINTERS *info)
+{
+	static std::atomic<bool> reported{false};
+	if (reported.exchange(true))
+		return EXCEPTION_CONTINUE_SEARCH;
+	const EXCEPTION_RECORD *e = info->ExceptionRecord;
+	char module[MAX_PATH];
+	DWORD64 offset = 0;
+	module_at((DWORD64)e->ExceptionAddress, module, sizeof(module), &offset);
+	DWORD thread = GetCurrentThreadId();
+	crash_line("The recorder crashed: exception 0x%08lX (%s) at %s+0x%llx, thread %lu%s", e->ExceptionCode, exception_name(e->ExceptionCode),
+		   module, offset, thread, thread == main_thread ? " (main)" : "");
+	if (e->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && e->NumberParameters >= 2) {
+		ULONG_PTR kind = e->ExceptionInformation[0];
+		crash_line("%s address 0x%llx", kind == 0 ? "Reading" : kind == 1 ? "Writing" : "Running code at",
+			   (unsigned long long)e->ExceptionInformation[1]);
+	}
+	CONTEXT ctx = *info->ContextRecord;
+	for (int i = 0; i < 32; i++) {
+		module_at(ctx.Rip, module, sizeof(module), &offset);
+		crash_line("  #%d %s+0x%llx", i, module, offset);
+		if (!unwind(&ctx))
+			break;
+	}
+	// Windows ends the process as it would have, with the exception as its exit code
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/** libobs gave up on an error it can't carry on from (bcrash). Its own handler would print it and exit(0). */
+static void on_library_crash(const char *format, va_list args, void *)
+{
+	char message[512];
+	vsnprintf(message, sizeof(message), format, args);
+	crash_line("The recorder stopped on a fatal error in its capture library: %s", message);
+	TerminateProcess(GetCurrentProcess(), 3);
+}
+
 // ---------- startup ----------
 
 static std::string utf8(const std::wstring &w)
@@ -920,6 +1052,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 	if (!log_file)
 		log_file = _wfsopen((config + L"\\recorder.log").c_str(), L"w", _SH_DENYNO);
 	base_set_log_handler(log_handler, nullptr);
+	base_set_crash_handler(on_library_crash, nullptr);
+	SetUnhandledExceptionFilter(on_crash);
 	blog(LOG_INFO, "---- recorder started (pid %lu) ----", GetCurrentProcessId());
 
 	std::string plugin_config = utf8(config) + "/plugin_config";
@@ -946,6 +1080,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 	obs_log_loaded_modules();
 	obs_post_load_modules();
 	register_app_audio_source();
+	// Again, in case a plugin set its own while loading
+	SetUnhandledExceptionFilter(on_crash);
 
 	std::thread(serve, L"\\\\.\\pipe\\" + pipe_name).detach();
 	std::thread(report_levels).detach();
