@@ -960,16 +960,21 @@ static const char *exception_name(DWORD code)
 	}
 }
 
-static LONG WINAPI on_crash(EXCEPTION_POINTERS *info)
+struct Crash {
+	EXCEPTION_POINTERS *info;
+	DWORD thread;
+};
+
+/** The "[crash]" lines for an exception on thread `crash->thread` */
+static DWORD WINAPI report_crash(void *param)
 {
-	static std::atomic<bool> reported{false};
-	if (reported.exchange(true))
-		return EXCEPTION_CONTINUE_SEARCH;
+	const Crash *crash = (const Crash *)param;
+	EXCEPTION_POINTERS *info = crash->info;
+	DWORD thread = crash->thread;
 	const EXCEPTION_RECORD *e = info->ExceptionRecord;
 	char module[MAX_PATH];
 	DWORD64 offset = 0;
 	module_at((DWORD64)e->ExceptionAddress, module, sizeof(module), &offset);
-	DWORD thread = GetCurrentThreadId();
 	crash_line("The recorder crashed: exception 0x%08lX (%s) at %s+0x%llx, thread %lu%s", e->ExceptionCode, exception_name(e->ExceptionCode),
 		   module, offset, thread, thread == main_thread ? " (main)" : "");
 	if (e->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && e->NumberParameters >= 2) {
@@ -983,6 +988,26 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *info)
 		crash_line("  #%d %s+0x%llx", i, module, offset);
 		if (!unwind(&ctx))
 			break;
+	}
+	return 0;
+}
+
+static LONG WINAPI on_crash(EXCEPTION_POINTERS *info)
+{
+	static std::atomic<bool> reported{false};
+	if (reported.exchange(true))
+		return EXCEPTION_CONTINUE_SEARCH;
+	Crash crash{info, GetCurrentThreadId()};
+	// A stack overflow leaves this thread almost no stack, too little for the report (a few KB): it's
+	// made on a new thread with a stack of its own, while this one waits
+	HANDLE helper = info->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW
+				? CreateThread(nullptr, 256 * 1024, report_crash, &crash, 0, nullptr)
+				: nullptr;
+	if (helper) {
+		WaitForSingleObject(helper, 5000);
+		CloseHandle(helper);
+	} else {
+		report_crash(&crash);
 	}
 	// Windows ends the process as it would have, with the exception as its exit code
 	return EXCEPTION_CONTINUE_SEARCH;
