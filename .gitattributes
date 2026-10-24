@@ -1,0 +1,2 @@
+# OBS's source is LF: the patch must reach git apply exactly as written
+native/win-capture/win-capture.patch -text

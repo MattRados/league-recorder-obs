@@ -65,11 +65,12 @@ try {
     const data = join(src, 'data', 'obs-plugins', p)
     if (existsSync(data)) cpSync(data, join(target, 'data', 'obs-plugins', p), { recursive: true })
   }
-  // OBS is GPLv2: ship its license and say where the matching source is
+  // OBS is GPLv2: ship its license and say where the matching source is. scripts/build-native.mjs rewrites this
+  // when it replaces win-capture.dll with the one built from source, to say what changed.
   writeFileSync(
     join(target, 'README-OBS.txt'),
     `This folder contains OBS Studio ${VERSION} (https://obsproject.com), unmodified, with some plugins left out.\r\n` +
-      `OBS Studio is licensed under the GNU General Public License v2: see data/obs-studio/license/gplv2.txt.\r\n` +
+      `OBS Studio is licensed under the GNU General Public License v2: see LICENSE-GPLv2.txt.\r\n` +
       `Source code for this exact version: https://github.com/obsproject/obs-studio/tree/${VERSION}\r\n`
   )
   console.log(`Installed OBS ${VERSION} to ${target} (${readdirSync(join(target, 'obs-plugins', '64bit')).length} plugins)`)

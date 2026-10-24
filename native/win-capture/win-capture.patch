@@ -1,0 +1,115 @@
+diff --git a/deps/ipc-util/ipc-util/pipe-windows.c b/deps/ipc-util/ipc-util/pipe-windows.c
+index cdecf9c..8d59695 100644
+--- a/deps/ipc-util/ipc-util/pipe-windows.c
++++ b/deps/ipc-util/ipc-util/pipe-windows.c
+@@ -141,6 +141,14 @@ static DWORD CALLBACK ipc_pipe_internal_server_thread(LPVOID param)
+ 		DWORD wait = WaitForMultipleObjects(_countof(handles), handles,
+ 						    FALSE, INFINITE);
+ 		if (wait != WAIT_OBJECT_0) {
++			/* League Recorder: told to stop with the read still
++			 * pending. Windows would still copy a message that
++			 * arrives into buf after this thread has left it (and
++			 * reused that stack for its exit), so cancel the read
++			 * and wait until it has really finished. */
++			CancelIoEx(pipe->handle, &pipe->overlap);
++			GetOverlappedResult(pipe->handle, &pipe->overlap,
++					    &bytes, true);
+ 			break;
+ 		}
+ 
+diff --git a/plugins/win-capture/game-capture.c b/plugins/win-capture/game-capture.c
+index 0c27047..fd55f1b 100644
+--- a/plugins/win-capture/game-capture.c
++++ b/plugins/win-capture/game-capture.c
+@@ -1302,6 +1302,13 @@ static inline bool init_events(struct game_capture *gc)
+ 			     GetLastError());
+ 			return false;
+ 		}
++		/* League Recorder: the hook only reads this event, never
++		 * sets it, so a signal here can be our own from the last
++		 * stop_capture, left when the game wasn't drawing (the hook
++		 * only looks while it captures). Taken as the hook stopping,
++		 * it ended each try at once and was set again for the next,
++		 * until the game drew its first frame. */
++		ResetEvent(gc->hook_stop);
+ 	}
+ 
+ 	if (!gc->hook_init) {
+diff --git a/plugins/win-capture/plugin-main.c b/plugins/win-capture/plugin-main.c
+index d379a14..ce29724 100644
+--- a/plugins/win-capture/plugin-main.c
++++ b/plugins/win-capture/plugin-main.c
+@@ -4,7 +4,11 @@
+ #include <util/windows/win-version.h>
+ #include <util/platform.h>
+ 
++/* League Recorder: the compatibility list is only used for warnings in OBS's own settings screen,
++ * so it's not downloaded from obsproject.com unless ENABLE_COMPAT_UPDATES is defined. */
++#ifdef ENABLE_COMPAT_UPDATES
+ #include <file-updater/file-updater.h>
++#endif
+ 
+ #include "compat-helpers.h"
+ #include "compat-format-ver.h"
+@@ -28,7 +32,9 @@ extern struct obs_source_info window_capture_info;
+ extern struct obs_source_info game_capture_info;
+ 
+ static HANDLE init_hooks_thread = NULL;
++#ifdef ENABLE_COMPAT_UPDATES
+ static update_info_t *update_info = NULL;
++#endif
+ 
+ extern bool cached_versions_match(void);
+ extern bool load_cached_graphics_offsets(bool is32bit, const char *config_path);
+@@ -79,6 +85,7 @@ void wait_for_hook_initialization(void)
+ 	}
+ }
+ 
++#ifdef ENABLE_COMPAT_UPDATES
+ static bool confirm_compat_file(void *param, struct file_download_data *file)
+ {
+ 	if (astrcmpi(file->name, "compatibility.json") == 0) {
+@@ -99,6 +106,7 @@ static bool confirm_compat_file(void *param, struct file_download_data *file)
+ 	UNUSED_PARAMETER(param);
+ 	return true;
+ }
++#endif
+ 
+ void init_hook_files(void);
+ 
+@@ -112,9 +120,11 @@ bool obs_module_load(void)
+ 	char *local_dir;
+ 	char *config_dir;
+ 
++#ifdef ENABLE_COMPAT_UPDATES
+ 	char update_url[128];
+ 	snprintf(update_url, sizeof(update_url), "%s/v%d", COMPAT_URL,
+ 		 COMPAT_FORMAT_VERSION);
++#endif
+ 
+ 	struct win_version_info win1903 = {.major = 10,
+ 					   .minor = 0,
+@@ -126,12 +136,14 @@ bool obs_module_load(void)
+ 	if (config_dir) {
+ 		os_mkdirs(config_dir);
+ 
++#ifdef ENABLE_COMPAT_UPDATES
+ 		if (local_dir) {
+ 			update_info = update_info_create(
+ 				WIN_CAPTURE_LOG_STRING, WIN_CAPTURE_VER_STRING,
+ 				update_url, local_dir, config_dir,
+ 				confirm_compat_file, NULL);
+ 		}
++#endif
+ 	}
+ 	bfree(config_dir);
+ 	bfree(local_dir);
+@@ -167,6 +179,8 @@ bool obs_module_load(void)
+ void obs_module_unload(void)
+ {
+ 	wait_for_hook_initialization();
++#ifdef ENABLE_COMPAT_UPDATES
+ 	update_info_destroy(update_info);
++#endif
+ 	compat_json_free();
+ }
