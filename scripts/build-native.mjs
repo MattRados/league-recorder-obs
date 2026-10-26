@@ -4,12 +4,14 @@
 //   native/media       -> bin/64bit/league-recorder-media.exe  audio track jobs, on the FFmpeg libraries OBS bundles
 //   native/win-capture -> obs-plugins/64bit/win-capture.dll    OBS's own capture plugin, built from its source
 //                                                              with our patch, in place of the bundled one
+//   runtime            -> bin/64bit/vcruntime140.dll, ...      the Visual C++ runtime, from Visual Studio's own
+//                                                              redistributable files
 // Needs the bundled OBS (scripts/fetch-obs.mjs), OBS's source (scripts/fetch-obs-sdk.mjs), the FFmpeg headers
 // (scripts/fetch-ffmpeg-headers.mjs) and jansson (scripts/fetch-jansson.mjs). Import libraries are generated
 // from the DLLs' exports.
 //
-//   node scripts/build-native.mjs                all three
-//   node scripts/build-native.mjs win-capture    only the ones named (recorder, media, win-capture)
+//   node scripts/build-native.mjs                all four
+//   node scripts/build-native.mjs win-capture    only the ones named (recorder, media, win-capture, runtime)
 
 import { execFileSync } from 'child_process'
 import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
@@ -137,4 +139,22 @@ if (building('win-capture')) {
       'Source code for this exact version: https://github.com/obsproject/obs-studio/tree/30.1.2\r\n'
   )
   console.log('Built', join(obsPlugins, 'win-capture.dll'))
+}
+
+// The Visual C++ runtime. OBS's libraries and plugins (and the capture plugin above) need it, and OBS's own
+// installer puts it on the PC, but its zip (scripts/fetch-obs.mjs) doesn't have it. On a PC without it the
+// recorder can't start, so nothing records (a tester's PC, 2026-10-25). Microsoft lets apps ship these files
+// next to their programs, where Windows looks first. The newest in Visual Studio's redistributable folder,
+// which is at least as new as what built OBS 30.1.2 and our parts.
+if (building('runtime')) {
+  const redist = join(vs, 'VC', 'Redist', 'MSVC')
+  const newest = readdirSync(redist)
+    .filter((v) => /^\d+\.\d+\.\d+$/.test(v))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+    .reverse()
+    .map((v) => join(redist, v, 'x64'))
+    .flatMap((dir) => (existsSync(dir) ? readdirSync(dir).filter((d) => /^Microsoft\.VC\d+\.CRT$/.test(d)).map((d) => join(dir, d)) : []))[0]
+  if (!newest) throw new Error(`No Visual C++ runtime in ${redist}`)
+  for (const dll of ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll']) copyFileSync(join(newest, dll), join(obsBin, dll))
+  console.log('Copied the Visual C++ runtime from', newest)
 }
