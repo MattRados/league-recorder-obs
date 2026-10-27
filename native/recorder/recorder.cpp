@@ -32,6 +32,7 @@
 #include <audioclient.h>
 #include <audioclientactivationparams.h>
 #include <mmdeviceapi.h>
+#include <psapi.h>
 #include <shellapi.h>
 #include <share.h>
 #include <tlhelp32.h>
@@ -54,11 +55,16 @@
 
 static FILE *log_file = nullptr;
 static std::mutex log_lock;
+/** When libobs last said the screen couldn't be captured the usual way (DXGI duplication), in os_gettime_ns; 0 = it hasn't */
+static std::atomic<uint64_t> duplicator_failed_at{0};
 
 static void log_handler(int level, const char *format, va_list args, void *)
 {
 	char message[8192];
 	vsnprintf(message, sizeof(message), format, args);
+	// libobs keeps trying every few seconds and only says so in the log: noted for the screen capture fallback (watch)
+	if (strncmp(message, "device_duplicator_create: Failed", 32) == 0 && !duplicator_failed_at)
+		duplicator_failed_at = os_gettime_ns();
 	SYSTEMTIME t;
 	GetLocalTime(&t);
 	std::lock_guard<std::mutex> lock(log_lock);
@@ -369,7 +375,9 @@ static std::atomic<bool> hooked{false};
 
 struct Recording {
 	obs_scene_t *scene = nullptr;
-	obs_source_t *game = nullptr;
+	obs_source_t *game = nullptr; // the picture: Game Capture, or the monitor for a screen recording
+	bool screen = false; // `game` is a monitor
+	bool screen_fallback = false; // ...captured with Windows Graphics Capture, the usual way having failed (watch)
 	std::vector<obs_source_t *> audio; // on output channels 1..n
 	std::vector<std::string> audio_ids; // the core's id for each of them (volume, levels)
 	obs_encoder_t *video_encoder = nullptr;
@@ -444,6 +452,122 @@ static void report_levels()
 	}
 }
 
+// ---------- the picture check ----------
+//
+// Whether what's being recorded is black, said in the log (owner, 2026-10-25: a tester's games and screen
+// recordings came out black, and the log couldn't say so for the screen). Every 2 s a 64x36 copy of the
+// canvas is made on the graphics card and read back a frame later, so nothing waits on the card: a few
+// thousand pixels every 2 s. The log gets a line when the picture turns black or comes back, and each
+// recording's totals when it ends (and in the status line every minute, below).
+
+static const uint32_t CHECK_W = 64, CHECK_H = 36;
+static const uint64_t CHECK_EVERY_NS = 2000000000ULL;
+
+struct PictureCheck {
+	gs_texrender_t *scaled = nullptr;
+	gs_stagesurf_t *stage = nullptr;
+	bool pending = false; // a copy was asked for and not read yet
+	uint64_t requested = 0;
+	uint8_t last[CHECK_W * CHECK_H] = {}; // each pixel's brightness at the last check
+	std::atomic<int> state{-1}; // -1 not checked yet, 0 black, 1 showing something
+	// Since the recording started (counting while one runs)
+	std::atomic<bool> counting{false};
+	std::atomic<int> checks{0}, black{0}, unchanged{0};
+};
+static PictureCheck picture;
+
+/** What a check found: the brightest pixel, the average, how many pixels are lit and how many changed (0-255 scale) */
+static void note_picture(int brightest, int average, int lit, int changed)
+{
+	const int all = CHECK_W * CHECK_H;
+	bool black = brightest <= 12;
+	if (picture.counting) {
+		picture.checks++;
+		picture.black += black;
+		picture.unchanged += changed == 0;
+	}
+	if (picture.state == (black ? 0 : 1))
+		return;
+	picture.state = black ? 0 : 1;
+	if (black)
+		blog(LOG_WARNING, "[recorder] picture: black (brightest pixel %d of 255)%s", brightest, picture.counting ? ", while recording" : "");
+	else
+		blog(LOG_INFO, "[recorder] picture: showing something (average brightness %d%%, %d%% of it lit)", average * 100 / 255, lit * 100 / all);
+	send_line(std::string("evt\tpicture\t") + (black ? "black" : "ok"));
+}
+
+/** After the canvas is drawn (graphics thread): read the last copy, and every 2 s ask for a new one */
+static void on_rendered(void *)
+{
+	PictureCheck &p = picture;
+	uint64_t now = os_gettime_ns();
+	if (p.pending) {
+		// Give the card a moment to make the copy, so mapping it doesn't wait
+		if (now - p.requested < 100000000ULL)
+			return;
+		p.pending = false;
+		uint8_t *data = nullptr;
+		uint32_t linesize = 0;
+		if (gs_stagesurface_map(p.stage, &data, &linesize)) {
+			int brightest = 0, lit = 0, changed = 0;
+			long long sum = 0;
+			for (uint32_t y = 0; y < CHECK_H; y++) {
+				for (uint32_t x = 0; x < CHECK_W; x++) {
+					const uint8_t *px = data + y * linesize + x * 4;
+					int v = std::max({px[0], px[1], px[2]});
+					brightest = std::max(brightest, v);
+					sum += v;
+					lit += v > 24;
+					uint8_t &was = p.last[y * CHECK_W + x];
+					changed += abs(v - was) > 8;
+					was = (uint8_t)v;
+				}
+			}
+			gs_stagesurface_unmap(p.stage);
+			note_picture(brightest, (int)(sum / (CHECK_W * CHECK_H)), lit, changed);
+		}
+	}
+	if (now - p.requested < CHECK_EVERY_NS)
+		return;
+	p.requested = now;
+	gs_texture_t *tex = obs_get_main_texture();
+	if (!tex)
+		return;
+	if (!p.scaled)
+		p.scaled = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	if (!p.stage)
+		p.stage = gs_stagesurface_create(CHECK_W, CHECK_H, GS_RGBA);
+	if (!p.scaled || !p.stage)
+		return;
+	uint32_t w = gs_texture_get_width(tex), h = gs_texture_get_height(tex);
+	gs_texrender_reset(p.scaled);
+	if (!gs_texrender_begin(p.scaled, CHECK_W, CHECK_H))
+		return;
+	vec4 clear;
+	vec4_zero(&clear);
+	gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+	gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
+	gs_blend_state_push();
+	gs_enable_blending(false);
+	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), tex);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite(tex, 0, w, h);
+	gs_blend_state_pop();
+	gs_texrender_end(p.scaled);
+	gs_stage_texture(p.stage, gs_texrender_get_texture(p.scaled));
+	p.pending = true;
+}
+
+/** A recording's picture totals, e.g. "black in 3 of 120 checks, unchanged in 5" */
+static std::string picture_totals()
+{
+	char text[128];
+	snprintf(text, sizeof(text), "picture black in %d of %d checks, unchanged in %d", picture.black.load(), picture.checks.load(),
+		 picture.unchanged.load());
+	return text;
+}
+
 static void on_hooked(void *, calldata_t *)
 {
 	hooked = true;
@@ -458,15 +582,21 @@ static void on_unhooked(void *, calldata_t *)
 
 static void on_output_start(void *, calldata_t *)
 {
+	picture.checks = picture.black = picture.unchanged = 0;
+	picture.counting = true;
+	blog(LOG_INFO, "[recorder] recording started: %s", rec.path.c_str());
 	send_line("evt\tstarted");
 }
 
 static void on_output_stop(void *, calldata_t *cd)
 {
 	long long code = calldata_int(cd, "code");
+	picture.counting = false;
 	if (code != OBS_OUTPUT_SUCCESS)
 		blog(LOG_WARNING, "[recorder] recording stopped with code %lld: %s", code,
 		     rec.output ? (obs_output_get_last_error(rec.output) ? obs_output_get_last_error(rec.output) : "") : "");
+	blog(LOG_INFO, "[recorder] recording stopped: %d frames written, %d dropped; %s", rec.output ? obs_output_get_total_frames(rec.output) : 0,
+	     rec.output ? obs_output_get_frames_dropped(rec.output) : 0, picture_totals().c_str());
 	send_line("evt\tstopped\t" + rec.path);
 }
 
@@ -537,6 +667,8 @@ static void teardown()
 		obs_source_release(rec.game);
 		rec.game = nullptr;
 	}
+	rec.screen = false;
+	rec.screen_fallback = false;
 	if (rec.scene) {
 		obs_scene_release(rec.scene);
 		rec.scene = nullptr;
@@ -614,22 +746,35 @@ static std::string apply_setup(const std::string &json)
 		const char *kind = obs_data_get_string(input, "kind");
 		const char *name = obs_data_get_string(input, "name");
 		obs_data_t *settings = obs_data_get_obj(input, "settings");
+		bool picture = strcmp(kind, "game_capture") == 0 || strcmp(kind, "monitor_capture") == 0;
+		// What each source was made with, for the log. A microphone's settings name the device, so audio
+		// sources only say what they are.
+		if (picture)
+			blog(LOG_INFO, "[recorder] picture source %s '%s': %s", kind, name, obs_data_get_json(settings));
+		else
+			blog(LOG_INFO, "[recorder] audio source %s '%s', tracks 0x%llx", kind, name, (long long)obs_data_get_int(input, "mixers"));
 		obs_source_t *source = obs_source_create_private(kind, name, settings);
 		obs_data_release(settings);
 		if (!source) {
 			blog(LOG_WARNING, "[recorder] couldn't create %s '%s'", kind, name);
-		} else if (strcmp(kind, "game_capture") == 0) {
+		} else if (picture && !rec.game) {
 			rec.game = source;
+			rec.screen = strcmp(kind, "monitor_capture") == 0;
+			duplicator_failed_at = 0;
 			obs_sceneitem_t *item = obs_scene_add(rec.scene, source);
-			// Scale Game Capture to fit the canvas, whatever size League's window is
+			// Scale it to fit the canvas, whatever size League's window (or the monitor) is
 			vec2 bounds;
 			vec2_set(&bounds, (float)bw, (float)bh);
 			obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_SCALE_INNER);
 			obs_sceneitem_set_bounds(item, &bounds);
 			obs_sceneitem_set_bounds_alignment(item, OBS_ALIGN_CENTER);
-			signal_handler_t *signals = obs_source_get_signal_handler(source);
-			signal_handler_connect(signals, "hooked", on_hooked, nullptr);
-			signal_handler_connect(signals, "unhooked", on_unhooked, nullptr);
+			if (!rec.screen) {
+				signal_handler_t *signals = obs_source_get_signal_handler(source);
+				signal_handler_connect(signals, "hooked", on_hooked, nullptr);
+				signal_handler_connect(signals, "unhooked", on_unhooked, nullptr);
+			}
+		} else if (picture) {
+			obs_source_release(source);
 		} else if (channel < MAX_CHANNELS) {
 			obs_source_set_audio_mixers(source, (uint32_t)obs_data_get_int(input, "mixers"));
 			obs_source_set_volume(source, obs_data_has_user_value(input, "volume") ? (float)obs_data_get_double(input, "volume") : 1.0f);
@@ -646,6 +791,7 @@ static std::string apply_setup(const std::string &json)
 	obs_set_output_source(0, obs_scene_get_source(rec.scene));
 
 	obs_data_t *encoder_settings = obs_data_get_obj(setup, "encoderSettings");
+	blog(LOG_INFO, "[recorder] video encoder %s: %s", obs_data_get_string(setup, "encoder"), obs_data_get_json(encoder_settings));
 	rec.video_encoder = obs_video_encoder_create(obs_data_get_string(setup, "encoder"), "video", encoder_settings, nullptr);
 	obs_data_release(encoder_settings);
 	if (!rec.video_encoder)
@@ -862,6 +1008,159 @@ static void serve(std::wstring name)
 		DisconnectNamedPipe(pipe);
 		CloseHandle(ov.hEvent);
 		CloseHandle(pipe);
+	}
+}
+
+static std::string utf8(const std::wstring &w);
+
+// ---------- rights, League's process, and a status line ----------
+//
+// More for the log (owner, 2026-10-25: "a log having too much information is almost always beneficial").
+// A tester's Game Capture said "could not open process" all game long, which doesn't say why: Windows'
+// reason and both programs' rights do. League running as administrator, with League Recorder not,
+// looks like "access denied" with League's rights unreadable.
+
+/** "elevated, integrity high (administrator)" for a process handle with at least limited query rights */
+static std::string rights_of(HANDLE process)
+{
+	HANDLE token = nullptr;
+	if (!OpenProcessToken(process, TOKEN_QUERY, &token))
+		return "its rights can't be read (error " + std::to_string(GetLastError()) + ")";
+	TOKEN_ELEVATION elevation = {};
+	DWORD size = 0;
+	bool elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) && elevation.TokenIsElevated;
+	std::string level = "unknown";
+	GetTokenInformation(token, TokenIntegrityLevel, nullptr, 0, &size);
+	std::vector<BYTE> label(size ? size : 1);
+	if (size && GetTokenInformation(token, TokenIntegrityLevel, label.data(), size, &size)) {
+		PSID sid = reinterpret_cast<TOKEN_MANDATORY_LABEL *>(label.data())->Label.Sid;
+		DWORD rid = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1);
+		level = rid >= SECURITY_MANDATORY_SYSTEM_RID   ? "system"
+			: rid >= SECURITY_MANDATORY_HIGH_RID   ? "high (administrator)"
+			: rid >= SECURITY_MANDATORY_MEDIUM_RID ? "medium (normal)"
+							       : "low";
+	}
+	CloseHandle(token);
+	return std::string(elevated ? "elevated" : "not elevated") + ", integrity " + level;
+}
+
+/** What Windows says when this process asks for League's process the way Game Capture does; "" if League isn't running */
+static std::string league_access()
+{
+	DWORD pid = find_root_process(L"League of Legends.exe");
+	if (!pid)
+		return "";
+	std::string head = "League of Legends.exe (pid " + std::to_string(pid) + ")";
+	HANDLE full = OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, pid);
+	if (full) {
+		std::string rights = rights_of(full);
+		CloseHandle(full);
+		return head + " can be opened for Game Capture (" + rights + "), so it isn't hooked for another reason";
+	}
+	DWORD error = GetLastError();
+	std::string text = head + " can't be opened for Game Capture: error " + std::to_string(error) + (error == ERROR_ACCESS_DENIED ? " (access denied)" : "");
+	HANDLE limited = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!limited)
+		return text + "; not even with limited rights (error " + std::to_string(GetLastError()) +
+		       "): something is blocking access to League (security software, or League runs with more rights)";
+	std::string rights = rights_of(limited);
+	CloseHandle(limited);
+	text += "; with limited rights it opens, " + rights;
+	if (error == ERROR_ACCESS_DENIED)
+		text += ". That's how League running with more rights than League Recorder looks (League or the Riot Client run as administrator)";
+	return text;
+}
+
+/** Every second: League's process while Game Capture isn't in it (on a change, or every 5 minutes), and
+ * while recording or keeping clips a status line every minute */
+static void watch()
+{
+	std::string last_access;
+	uint64_t access_checked = 0, access_logged = 0, last_status = 0;
+	FILETIME was_kernel = {}, was_user = {}, unused;
+	uint64_t was_at = os_gettime_ns();
+	GetProcessTimes(GetCurrentProcess(), &unused, &unused, &was_kernel, &was_user);
+	auto ticks = [](FILETIME t) { return ((uint64_t)t.dwHighDateTime << 32) | t.dwLowDateTime; };
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	while (!exiting) {
+		Sleep(1000);
+		uint64_t now = os_gettime_ns();
+		bool waiting = false;
+		{
+			std::lock_guard<std::mutex> lock(obs_lock);
+			// (Closing: libobs is about to go, see the end of wWinMain)
+			if (exiting)
+				return;
+			waiting = rec.game && !rec.screen && !hooked;
+			// The screen, when Windows refuses the usual way of capturing it (DXGI duplication: "unsupported" on
+			// some PCs, e.g. from inside some sandboxes, and the picture stays black) for 2 s: Windows Graphics
+			// Capture instead, which worked where it didn't (2026-10-25). Not the first choice: on Windows 10 it
+			// puts a yellow border around the screen while it records. Only for this setup (a new one tries the
+			// usual way again).
+			uint64_t failed = duplicator_failed_at;
+			if (rec.screen && !rec.screen_fallback && failed && now - failed >= 2000000000ULL && picture.state == 0) {
+				rec.screen_fallback = true;
+				blog(LOG_WARNING, "[recorder] screen capture: Windows refused the usual way of capturing the screen (DXGI, the "
+						  "\"Failed\" lines above), so it's captured with Windows Graphics Capture instead");
+				obs_data_t *settings = obs_source_get_settings(rec.game);
+				obs_data_set_int(settings, "method", 2);
+				obs_source_update(rec.game, settings);
+				obs_data_release(settings);
+				send_line("evt\tscreen-fallback");
+			}
+			if ((recording_active() || buffer_active()) && now - last_status >= 60000000000ULL) {
+				last_status = now;
+				FILETIME kernel, user;
+				GetProcessTimes(GetCurrentProcess(), &unused, &unused, &kernel, &user);
+				double busy = (double)(ticks(kernel) + ticks(user) - ticks(was_kernel) - ticks(was_user)) * 100.0; // ns
+				double cores = busy / (double)(now - was_at);
+				was_kernel = kernel, was_user = user, was_at = now;
+				PROCESS_MEMORY_COUNTERS memory = {sizeof(memory)};
+				GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory));
+				char line[1024];
+				snprintf(line, sizeof(line),
+					 "[recorder] status: %s%s, %s %ux%u, canvas %.1f fps, lagged frames %u, encoder skipped %u of %u, %s; "
+					 "using %.2f of %lu cores, %llu MB",
+					 recording_active() ? "recording" : "not recording", buffer_active() ? ", keeping clips" : "",
+					 rec.screen ? "screen" : hooked ? "League hooked" : "League NOT hooked", rec.game ? obs_source_get_width(rec.game) : 0,
+					 rec.game ? obs_source_get_height(rec.game) : 0, obs_get_active_fps(), obs_get_lagged_frames(),
+					 video_output_get_skipped_frames(obs_get_video()), video_output_get_total_frames(obs_get_video()),
+					 picture.counting ? picture_totals().c_str() : "no recording", cores, si.dwNumberOfProcessors,
+					 (unsigned long long)(memory.WorkingSetSize >> 20));
+				blog(LOG_INFO, "%s", line);
+			}
+		}
+		if (!waiting) {
+			last_access.clear();
+			continue;
+		}
+		if (now - access_checked < 5000000000ULL)
+			continue;
+		access_checked = now;
+		std::string access = league_access();
+		if (!access.empty() && (access != last_access || now - access_logged >= 300000000000ULL)) {
+			blog(access.find("can't") != std::string::npos ? LOG_WARNING : LOG_INFO, "[recorder] %s", access.c_str());
+			access_logged = now;
+		}
+		last_access = access;
+	}
+}
+
+/** Who and where the recorder runs as, at its start */
+static void log_environment()
+{
+	DWORD session = 0;
+	ProcessIdToSessionId(GetCurrentProcessId(), &session);
+	blog(LOG_INFO, "[recorder] running %s; Windows session %lu%s", rights_of(GetCurrentProcess()).c_str(), session,
+	     GetSystemMetrics(SM_REMOTESESSION) ? " (a remote desktop session: screen capture may be black)" : "");
+	// Which C++ runtime it loaded: the copy next to it (shipped from 0.5.31), or Windows' own
+	for (const wchar_t *dll : {L"vcruntime140.dll", L"vcruntime140_1.dll", L"msvcp140.dll"}) {
+		HMODULE module = GetModuleHandleW(dll);
+		wchar_t path[MAX_PATH] = L"";
+		if (module)
+			GetModuleFileNameW(module, path, MAX_PATH);
+		blog(LOG_INFO, "[recorder] %s: %s", utf8(dll).c_str(), module ? utf8(path).c_str() : "not loaded");
 	}
 }
 
@@ -1107,9 +1406,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 	register_app_audio_source();
 	// Again, in case a plugin set its own while loading
 	SetUnhandledExceptionFilter(on_crash);
+	log_environment();
+	obs_add_main_rendered_callback(on_rendered, nullptr);
 
 	std::thread(serve, L"\\\\.\\pipe\\" + pipe_name).detach();
 	std::thread(report_levels).detach();
+	std::thread(watch).detach();
 	blog(LOG_INFO, "[recorder] ready");
 
 	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -1134,6 +1436,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 			obs_output_force_stop(rec.replay);
 		teardown();
 	}
+	obs_remove_main_rendered_callback(on_rendered, nullptr);
+	obs_enter_graphics();
+	gs_texrender_destroy(picture.scaled);
+	gs_stagesurface_destroy(picture.stage);
+	obs_leave_graphics();
 	obs_shutdown();
 	blog(LOG_INFO, "[recorder] closed");
 	if (log_file)

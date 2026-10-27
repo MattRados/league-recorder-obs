@@ -72,7 +72,7 @@ const cl = 'cl /nologo /O2 /EHsc /std:c++17 /utf-8 /W3 /DUNICODE /D_UNICODE /DNO
 // The recorder
 if (building('recorder')) {
   msvc([
-    `${cl} /I "${obsSdk}" "${join(root, 'native', 'recorder', 'recorder.cpp')}" ${importLib('obs.dll')} user32.lib shell32.lib ole32.lib mmdevapi.lib /Fe:league-recorder-obs.exe /link /NOLOGO /SUBSYSTEM:WINDOWS`
+    `${cl} /I "${obsSdk}" "${join(root, 'native', 'recorder', 'recorder.cpp')}" ${importLib('obs.dll')} user32.lib shell32.lib ole32.lib mmdevapi.lib advapi32.lib /Fe:league-recorder-obs.exe /link /NOLOGO /SUBSYSTEM:WINDOWS`
   ])
   copyFileSync(join(work, 'league-recorder-obs.exe'), join(obsBin, 'league-recorder-obs.exe'))
   console.log('Built', join(obsBin, 'league-recorder-obs.exe'))
