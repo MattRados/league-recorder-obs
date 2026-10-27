@@ -33,6 +33,7 @@
 #include <audioclientactivationparams.h>
 #include <mmdeviceapi.h>
 #include <psapi.h>
+#include <sddl.h>
 #include <shellapi.h>
 #include <share.h>
 #include <tlhelp32.h>
@@ -955,12 +956,47 @@ static void handle_line(const std::string &line)
 	send_line(error.empty() ? "res\t" + id + "\tok" + extra : "res\t" + id + "\terror\t" + error);
 }
 
+/**
+ * Who may use the pipe: this Windows user (and the system and administrators), from a normal app too. Started
+ * with administrator rights (when League runs with them, 2026-10-26), the pipe's default rights would let the
+ * app only read it: they go to the administrators, and an elevated process's objects are out of a normal one's
+ * reach for writing. Null (Windows' default) if the user can't be read.
+ */
+static SECURITY_ATTRIBUTES *pipe_security()
+{
+	static SECURITY_ATTRIBUTES attributes = {sizeof(attributes), nullptr, FALSE};
+	if (attributes.lpSecurityDescriptor)
+		return &attributes;
+	HANDLE token = nullptr;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+		return nullptr;
+	DWORD size = 0;
+	GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+	std::vector<BYTE> user(size ? size : 1);
+	wchar_t *sid = nullptr;
+	if (size && GetTokenInformation(token, TokenUser, user.data(), size, &size))
+		ConvertSidToStringSidW(((TOKEN_USER *)user.data())->User.Sid, &sid);
+	CloseHandle(token);
+	if (!sid)
+		return nullptr;
+	// Full access for the system, administrators and this user; the medium label lets a normal app write to it
+	std::wstring sddl = std::wstring(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;") + sid + L")S:(ML;;NW;;;ME)";
+	LocalFree(sid);
+	PSECURITY_DESCRIPTOR descriptor = nullptr;
+	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
+		blog(LOG_WARNING, "[recorder] the pipe's rights couldn't be set (error %lu): Windows' default", GetLastError());
+		return nullptr;
+	}
+	attributes.lpSecurityDescriptor = descriptor;
+	return &attributes;
+}
+
 static void serve(std::wstring name)
 {
 	while (!exiting) {
 		HANDLE pipe = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
 					       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
-					       64 * 1024, 64 * 1024, 0, nullptr);
+					       64 * 1024, 64 * 1024, 0, pipe_security());
 		if (pipe == INVALID_HANDLE_VALUE) {
 			blog(LOG_WARNING, "[recorder] CreateNamedPipe failed: %lu", GetLastError());
 			Sleep(1000);
