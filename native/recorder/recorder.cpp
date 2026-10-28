@@ -373,6 +373,11 @@ static void register_app_audio_source()
 
 static std::mutex obs_lock; // one command at a time
 static std::atomic<bool> hooked{false};
+/** Running with administrator rights (set at start; see "who may connect") */
+static bool running_elevated = false;
+/** The install folder: three up from this exe (obs\bin\64bit) */
+static std::wstring install_dir;
+static std::string utf8(const std::wstring &w);
 
 struct Recording {
 	obs_scene_t *scene = nullptr;
@@ -915,7 +920,9 @@ static void handle_line(const std::string &line)
 		if (cmd == "setup" && head.size() >= 3) {
 			error = apply_setup(head[2]);
 		} else if (cmd == "status") {
-			extra = std::string("\t") + (recording_active() ? "1" : "0") + "\t" + (hooked ? "1" : "0") + "\t" + (buffer_active() ? "1" : "0");
+			// (The last: running with administrator rights, so a core started again after a crash knows: leagueAdmin.ts)
+			extra = std::string("\t") + (recording_active() ? "1" : "0") + "\t" + (hooked ? "1" : "0") + "\t" + (buffer_active() ? "1" : "0") + "\t" +
+				(running_elevated ? "1" : "0");
 		} else if (cmd == "start" && head.size() >= 3) {
 			std::vector<std::string> args = split_tabs(head[2]);
 			error = args.size() >= 2 ? start_recording(args[0], args[1]) : "start needs a folder and a name";
@@ -991,8 +998,79 @@ static SECURITY_ATTRIBUTES *pipe_security()
 	return &attributes;
 }
 
+// ---------- who may connect ----------
+//
+// With administrator rights the pipe is open to normal programs (above), so any program running as this user could
+// otherwise drive a recorder that has those rights: start a recording into one of Windows' own folders, say. So
+// then it takes commands only from League Recorder's core in this install (core\league-recorder-core.exe), started
+// by League Recorder's window in this install (League Recorder.exe). That keeps out a program that merely finds the
+// pipe; one set on getting in could still go further, since the install folder is the user's own (2026-10-27).
+
+/** A process's program and when it started; "" if it can't be read */
+static std::wstring image_of(DWORD pid, ULONGLONG *created)
+{
+	HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!process)
+		return L"";
+	wchar_t path[MAX_PATH * 2];
+	DWORD len = _countof(path);
+	std::wstring image = QueryFullProcessImageNameW(process, 0, path, &len) ? std::wstring(path, len) : L"";
+	FILETIME start, unused;
+	if (created)
+		*created = GetProcessTimes(process, &start, &unused, &unused, &unused) ? ((ULONGLONG)start.dwHighDateTime << 32) | start.dwLowDateTime : 0;
+	CloseHandle(process);
+	return image;
+}
+
+/** The process that started `pid` (0 if it isn't known) */
+static DWORD parent_of(DWORD pid)
+{
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE)
+		return 0;
+	DWORD parent = 0;
+	PROCESSENTRY32W e{sizeof(e)};
+	for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e))
+		if (e.th32ProcessID == pid) {
+			parent = e.th32ParentProcessID;
+			break;
+		}
+	CloseHandle(snap);
+	return parent;
+}
+
+/** Whether the program connected to `pipe` is League Recorder's core, started by its window; `why` says if not */
+static bool trusted_client(HANDLE pipe, std::string &why)
+{
+	ULONG pid = 0;
+	if (!GetNamedPipeClientProcessId(pipe, &pid)) {
+		why = "Windows didn't say which program it is (error " + std::to_string(GetLastError()) + ")";
+		return false;
+	}
+	ULONGLONG started = 0, parent_started = 0;
+	std::wstring image = image_of(pid, &started);
+	if (_wcsicmp(image.c_str(), (install_dir + L"\\core\\league-recorder-core.exe").c_str()) != 0) {
+		why = "pid " + std::to_string(pid) + " is " + (image.empty() ? std::string("a program that can't be read") : utf8(image)) + ", not League Recorder's core";
+		return false;
+	}
+	DWORD parent = parent_of(pid);
+	std::wstring parent_image = parent ? image_of(parent, &parent_started) : L"";
+	// (A parent that started after its child is another program that got the old one's number)
+	if (_wcsicmp(parent_image.c_str(), (install_dir + L"\\League Recorder.exe").c_str()) != 0 || parent_started > started) {
+		why = "League Recorder's core (pid " + std::to_string(pid) + "), but not started by League Recorder's window (its parent: " +
+		      (parent_image.empty() ? std::string("gone or unreadable") : utf8(parent_image)) + ")";
+		return false;
+	}
+	return true;
+}
+
 static void serve(std::wstring name)
 {
+	// (LR_RECORDER_CHECK_CLIENTS=1 checks connections without administrator rights too, for testing)
+	wchar_t forced[4] = L"";
+	bool check = running_elevated || (GetEnvironmentVariableW(L"LR_RECORDER_CHECK_CLIENTS", forced, 4) && forced[0] == L'1');
+	if (check)
+		blog(LOG_INFO, "[recorder] taking commands only from League Recorder's core in %s", utf8(install_dir).c_str());
 	while (!exiting) {
 		HANDLE pipe = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
 					       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
@@ -1013,6 +1091,11 @@ static void serve(std::wstring name)
 			} else {
 				connected = err == ERROR_PIPE_CONNECTED;
 			}
+		}
+		std::string why;
+		if (connected && check && !trusted_client(pipe, why)) {
+			blog(LOG_WARNING, "[recorder] refused a connection: %s", why.c_str());
+			connected = false;
 		}
 		if (connected) {
 			{
@@ -1380,6 +1463,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 			*slash = L'\0';
 			SetCurrentDirectoryW(exe_path);
 		}
+	}
+	// The install folder (from obs\bin\64bit) and this process's rights, for who may connect (serve)
+	install_dir = exe_path;
+	for (int up = 0; up < 3; up++)
+		install_dir = install_dir.substr(0, install_dir.find_last_of(L'\\') == std::wstring::npos ? 0 : install_dir.find_last_of(L'\\'));
+	HANDLE self_token = nullptr;
+	if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &self_token)) {
+		TOKEN_ELEVATION elevation = {};
+		DWORD size = 0;
+		running_elevated = GetTokenInformation(self_token, TokenElevation, &elevation, sizeof(elevation), &size) && elevation.TokenIsElevated;
+		CloseHandle(self_token);
 	}
 	main_thread = GetCurrentThreadId();
 	MSG msg;
