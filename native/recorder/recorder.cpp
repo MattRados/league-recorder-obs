@@ -58,6 +58,11 @@ static FILE *log_file = nullptr;
 static std::mutex log_lock;
 /** When libobs last said the screen couldn't be captured the usual way (DXGI duplication), in os_gettime_ns; 0 = it hasn't */
 static std::atomic<uint64_t> duplicator_failed_at{0};
+/** How many times Game Capture couldn't open its connection to League's hook since it was last in League: only
+ *  one program can have it, so another one capturing League the same way has the game (watch) */
+static std::atomic<int> hook_pipe_taken{0};
+/** When the app asked to stop the recording, while it hasn't stopped yet (os_gettime_ns; 0 = not stopping) */
+static std::atomic<uint64_t> stop_asked_at{0};
 
 static void log_handler(int level, const char *format, va_list args, void *)
 {
@@ -66,6 +71,8 @@ static void log_handler(int level, const char *format, va_list args, void *)
 	// libobs keeps trying every few seconds and only says so in the log: noted for the screen capture fallback (watch)
 	if (strncmp(message, "device_duplicator_create: Failed", 32) == 0 && !duplicator_failed_at)
 		duplicator_failed_at = os_gettime_ns();
+	if (strstr(message, "init_pipe: failed to start pipe"))
+		hook_pipe_taken++;
 	SYSTEMTIME t;
 	GetLocalTime(&t);
 	std::lock_guard<std::mutex> lock(log_lock);
@@ -577,6 +584,7 @@ static std::string picture_totals()
 static void on_hooked(void *, calldata_t *)
 {
 	hooked = true;
+	hook_pipe_taken = 0;
 	send_line("evt\thooked");
 }
 
@@ -598,6 +606,7 @@ static void on_output_stop(void *, calldata_t *cd)
 {
 	long long code = calldata_int(cd, "code");
 	picture.counting = false;
+	stop_asked_at = 0;
 	if (code != OBS_OUTPUT_SUCCESS)
 		blog(LOG_WARNING, "[recorder] recording stopped with code %lld: %s", code,
 		     rec.output ? (obs_output_get_last_error(rec.output) ? obs_output_get_last_error(rec.output) : "") : "");
@@ -680,6 +689,7 @@ static void teardown()
 		rec.scene = nullptr;
 	}
 	hooked = false;
+	hook_pipe_taken = 0;
 	rec.applied.clear();
 }
 
@@ -907,6 +917,175 @@ static std::string save_clip()
 	return "";
 }
 
+// ---------- a stop or a close that doesn't finish ----------
+//
+// A tester's recorder (2026-10-29) never finished stopping a recording: OBS's muxer output waits, with no limit,
+// for its file writer (obs-ffmpeg-mux.exe) to exit once it has the last frames, on the thread that hands the
+// encoder's frames on. The writer never did, so that thread stopped for good: the recorder said "recording"
+// from then on (the next two games: "Already recording"), and closing it later hung the same way. Started with
+// administrator rights, the app couldn't end it either, so it lived on next to the next recorder and took
+// League's picture in 4 of the next 5 games (the other's video black). Why the writer hung isn't known (what's
+// logged when it's ended below should say more), so both waits get a limit here. The video is written in
+// 2-second pieces as it goes (fragmented MP4), so ending the writer loses at most the last moments.
+// A writer that's slow but still going (a drive waking up, a busy network folder) isn't stuck: past the first
+// limit it's ended only once it has made no progress for a few seconds, neither writing to the file nor using
+// the processor (the tester's used none at all), and at the latest well before the app gives up on the stop.
+
+/** How long a stop may take before the file writer is looked at (it normally takes well under a second) */
+static const uint64_t STOP_STUCK_NS = 15000000000ULL;
+/** From then on, how often it's looked at: no progress since the last look and it's ended */
+static const uint64_t STOP_LOOK_NS = 5000000000ULL;
+/** ...and the latest it's ended, still working or not (the app waits 60 s for a stop: obs.ts stop) */
+static const uint64_t STOP_GIVE_UP_NS = 45000000000ULL;
+/** How long closing may take before the recorder ends itself */
+static const DWORD CLOSE_STUCK_MS = 10000;
+/** How long the recorder runs on with no app connected before it closes (watch) */
+static const uint64_t ALONE_NS = 30000000000ULL;
+
+/** League's game, which a recording with no app waits for (LR_RECORDER_LEAGUE_EXE names another, for testing) */
+static const std::wstring &league_exe()
+{
+	static const std::wstring exe = [] {
+		wchar_t name[MAX_PATH] = L"";
+		return GetEnvironmentVariableW(L"LR_RECORDER_LEAGUE_EXE", name, MAX_PATH) ? std::wstring(name) : std::wstring(L"League of Legends.exe");
+	}();
+	return exe;
+}
+
+static std::wstring image_of(DWORD pid, ULONGLONG *created);
+
+static double cpu_seconds(HANDLE process)
+{
+	FILETIME unused, kernel, user;
+	if (!GetProcessTimes(process, &unused, &unused, &kernel, &user))
+		return -1;
+	auto ticks = [](FILETIME t) { return ((uint64_t)t.dwHighDateTime << 32) | t.dwLowDateTime; };
+	return (double)(ticks(kernel) + ticks(user)) / 1e7;
+}
+
+/** The programs this recorder started that are still running (`exe` only, if given): by parent id, and started
+ *  after this one, so never another program's (OBS Studio has its own obs-ffmpeg-mux.exe) */
+static std::vector<DWORD> own_children(const wchar_t *exe)
+{
+	std::vector<DWORD> found;
+	ULONGLONG self_created = 0;
+	image_of(GetCurrentProcessId(), &self_created);
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE)
+		return found;
+	PROCESSENTRY32W e{sizeof(e)};
+	for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e)) {
+		if (e.th32ParentProcessID != GetCurrentProcessId() || (exe && _wcsicmp(e.szExeFile, exe) != 0))
+			continue;
+		ULONGLONG created = 0;
+		image_of(e.th32ProcessID, &created);
+		if (created >= self_created)
+			found.push_back(e.th32ProcessID);
+	}
+	CloseHandle(snap);
+	return found;
+}
+
+/** The file writers running when the stop was asked for, with their CPU time then (to tell busy from waiting) */
+static std::vector<std::pair<DWORD, double>> writers_at_stop;
+/** ...their CPU time and the video's size at the last look since (writers_progressed) */
+static std::vector<std::pair<DWORD, double>> writers_looked;
+static int64_t size_looked = -1;
+static std::mutex writers_lock;
+
+static void note_writers_at_stop()
+{
+	std::lock_guard<std::mutex> lock(writers_lock);
+	writers_at_stop.clear();
+	for (DWORD pid : own_children(L"obs-ffmpeg-mux.exe")) {
+		HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+		writers_at_stop.push_back({pid, process ? cpu_seconds(process) : -1});
+		if (process)
+			CloseHandle(process);
+	}
+	writers_looked = writers_at_stop;
+	size_looked = os_get_file_size(rec.path.c_str());
+}
+
+/** Whether the file writers did anything since the last look: the video grew, or one used the processor */
+static bool writers_progressed()
+{
+	std::lock_guard<std::mutex> lock(writers_lock);
+	bool progressed = false;
+	int64_t size = os_get_file_size(rec.path.c_str());
+	if (size > size_looked)
+		progressed = true;
+	size_looked = size;
+	for (auto &w : writers_looked) {
+		HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, w.first);
+		if (!process)
+			continue;
+		double cpu = cpu_seconds(process);
+		CloseHandle(process);
+		if (cpu >= 0 && w.second >= 0 && cpu - w.second >= 0.05)
+			progressed = true;
+		w.second = cpu;
+	}
+	return progressed;
+}
+
+/** End this recorder's file writers (only those running at the stop, if `at_stop`) and log what each was doing */
+static void end_file_writers(const char *why, bool at_stop)
+{
+	std::vector<DWORD> pids = own_children(L"obs-ffmpeg-mux.exe");
+	std::lock_guard<std::mutex> lock(writers_lock);
+	for (DWORD pid : pids) {
+		auto was = std::find_if(writers_at_stop.begin(), writers_at_stop.end(), [pid](auto &w) { return w.first == pid; });
+		if (at_stop && was == writers_at_stop.end())
+			continue;
+		HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+		if (!process) {
+			blog(LOG_WARNING, "[recorder] %s: the file writer (obs-ffmpeg-mux.exe, pid %lu) couldn't be opened to end it (error %lu)", why, pid,
+			     GetLastError());
+			continue;
+		}
+		double cpu = cpu_seconds(process);
+		char busy[128] = "";
+		if (was != writers_at_stop.end() && was->second >= 0 && cpu >= 0)
+			snprintf(busy, sizeof(busy), ", %.2f s of CPU since the stop (%s)", cpu - was->second,
+				 cpu - was->second < 0.05 ? "it was waiting on something" : "it was still working");
+		bool ended = TerminateProcess(process, 1);
+		blog(LOG_WARNING, "[recorder] %s: %s the file writer (obs-ffmpeg-mux.exe, pid %lu%s)", why, ended ? "ended" : "couldn't end", pid, busy);
+		CloseHandle(process);
+	}
+}
+
+/** Closing (quit) hasn't finished in CLOSE_STUCK_MS: end this recorder, with what it started, rather than run on */
+static void end_if_closing_hangs()
+{
+	Sleep(CLOSE_STUCK_MS);
+	blog(LOG_WARNING, "[recorder] closing hasn't finished after %lu s: ending now", CLOSE_STUCK_MS / 1000);
+	end_file_writers("closing hung", false);
+	for (DWORD pid : own_children(nullptr)) {
+		HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+		if (process) {
+			TerminateProcess(process, 1);
+			CloseHandle(process);
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(log_lock);
+		if (log_file)
+			fflush(log_file);
+	}
+	// (Not ExitProcess: that runs every library's clean-up, where it may hang the same way)
+	TerminateProcess(GetCurrentProcess(), 0);
+}
+
+/** Close: the main loop ends, stops what's still running and shuts libobs down (with the limit above) */
+static void close_recorder()
+{
+	if (!exiting)
+		std::thread(end_if_closing_hangs).detach();
+	exiting = true;
+	PostThreadMessageW(main_thread, WM_QUIT, 0, 0);
+}
+
 static void handle_line(const std::string &line)
 {
 	std::vector<std::string> head = split_tabs(line, 3);
@@ -927,9 +1106,11 @@ static void handle_line(const std::string &line)
 			std::vector<std::string> args = split_tabs(head[2]);
 			error = args.size() >= 2 ? start_recording(args[0], args[1]) : "start needs a folder and a name";
 		} else if (cmd == "stop") {
-			if (recording_active())
+			if (recording_active()) {
+				note_writers_at_stop();
+				stop_asked_at = os_gettime_ns();
 				obs_output_stop(rec.output);
-			else
+			} else
 				error = "Not recording";
 		} else if (cmd == "buffer-start" && head.size() >= 3) {
 			std::vector<std::string> args = split_tabs(head[2]);
@@ -954,8 +1135,7 @@ static void handle_line(const std::string &line)
 		} else if (cmd == "meters" && head.size() >= 3) {
 			metering = head[2] == "on";
 		} else if (cmd == "quit") {
-			exiting = true;
-			PostThreadMessageW(main_thread, WM_QUIT, 0, 0);
+			close_recorder();
 		} else {
 			error = "Unknown command " + cmd;
 		}
@@ -1195,6 +1375,11 @@ static std::string league_access()
 static void watch()
 {
 	std::string last_access;
+	bool hook_taken_said = false;
+	uint64_t writers_ended_at = 0, stop_looked_at = 0;
+	bool slow_stop_said = false;
+	uint64_t alone_since = 0;
+	bool finishing_alone = false;
 	uint64_t access_checked = 0, access_logged = 0, last_status = 0;
 	FILETIME was_kernel = {}, was_user = {}, unused;
 	uint64_t was_at = os_gettime_ns();
@@ -1250,14 +1435,97 @@ static void watch()
 				blog(LOG_INFO, "%s", line);
 			}
 		}
+		// A stop that hasn't finished: its file writer is what it waits on (see "a stop or a close that doesn't finish").
+		// Still writing or working, it's given more time; with no progress since the last look it's ended. With it
+		// ended, OBS reports the stop but can still count the output as running (checked with a frozen writer:
+		// "Already recording" next), so a few seconds later it's stopped outright.
+		uint64_t asked = stop_asked_at;
+		if (asked && now - asked >= STOP_STUCK_NS && now - stop_looked_at >= STOP_LOOK_NS) {
+			stop_looked_at = now;
+			bool progressed = writers_progressed();
+			unsigned long long waited = (now - asked) / 1000000000ULL;
+			if (progressed && now - asked < STOP_GIVE_UP_NS) {
+				if (!slow_stop_said)
+					blog(LOG_INFO, "[recorder] the recording is still being finished %llu s after the stop (its file writer is still working): waiting", waited);
+				slow_stop_said = true;
+			} else {
+				stop_asked_at = 0;
+				blog(LOG_WARNING, "[recorder] the recording hasn't stopped %llu s after it was asked to%s", waited,
+				     progressed ? " (its file writer was still working, but that's the limit)" : " (no progress in the last 5 s)");
+				end_file_writers("stopping hung", true);
+				writers_ended_at = now;
+			}
+		}
+		if (!asked)
+			stop_looked_at = 0, slow_stop_said = false;
+		if (writers_ended_at && now - writers_ended_at >= 3000000000ULL) {
+			writers_ended_at = 0;
+			std::lock_guard<std::mutex> lock(obs_lock);
+			if (recording_active()) {
+				blog(LOG_WARNING, "[recorder] still recording after its file writer was ended: stopping it outright");
+				obs_output_force_stop(rec.output);
+			}
+		}
+		// No app connected: the recorder carries on by itself so that an app started again (its core restarts in
+		// under a second after a crash; its crash window's Restart) takes over the same recording. But with the app
+		// gone for good (ended in Task Manager, crashed outright, quit while its crash window was up) nothing would
+		// ever tell it to stop, and it would run, and record, until the PC restarts. So after ALONE_NS with no app:
+		// not recording, it closes; recording a game, it finishes the video once League's game has closed (an app
+		// started before then still takes it over), a screen recording at once. The app's next start finds the
+		// saved video and adds it to the library (resume.ts).
+		bool alone;
+		{
+			std::lock_guard<std::mutex> lock(write_lock);
+			alone = client == INVALID_HANDLE_VALUE;
+		}
+		if (!alone)
+			alone_since = 0, finishing_alone = false;
+		else if (!alone_since)
+			alone_since = now;
+		if (alone && now - alone_since >= ALONE_NS) {
+			bool recording, screen;
+			{
+				std::lock_guard<std::mutex> lock(obs_lock);
+				recording = recording_active();
+				screen = rec.screen;
+			}
+			if (!recording && !stop_asked_at) {
+				blog(LOG_INFO, "[recorder] no app has been connected for %llu s%s: closing", (unsigned long long)((now - alone_since) / 1000000000ULL),
+				     finishing_alone ? " and the recording is saved" : "");
+				close_recorder();
+				return;
+			}
+			if (recording && !finishing_alone && (screen || !find_root_process(league_exe()))) {
+				finishing_alone = true;
+				blog(LOG_WARNING, "[recorder] no app has been connected for %llu s and %s: finishing the recording, then closing",
+				     (unsigned long long)((now - alone_since) / 1000000000ULL), screen ? "this is a screen recording" : "League's game has closed");
+				std::lock_guard<std::mutex> lock(obs_lock);
+				note_writers_at_stop();
+				stop_asked_at = os_gettime_ns();
+				obs_output_stop(rec.output);
+			}
+		}
 		if (!waiting) {
 			last_access.clear();
+			hook_taken_said = false;
 			continue;
+		}
+		// Another program has League's hook (it keeps refusing the connection): said once each game, so the app can
+		// say why the video is black. In the tester's games it was this recorder's own earlier copy, still running.
+		if (hook_pipe_taken >= 3 && !hook_taken_said) {
+			hook_taken_said = true;
+			blog(LOG_WARNING, "[recorder] Game Capture can't connect to League's hook: another program capturing League the same way has it");
+			send_line("evt\thook-taken");
 		}
 		if (now - access_checked < 5000000000ULL)
 			continue;
 		access_checked = now;
 		std::string access = league_access();
+		// (League closed: the next game is told about again)
+		if (access.empty()) {
+			hook_pipe_taken = 0;
+			hook_taken_said = false;
+		}
 		if (!access.empty() && (access != last_access || now - access_logged >= 300000000000ULL)) {
 			blog(access.find("can't") != std::string::npos ? LOG_WARNING : LOG_INFO, "[recorder] %s", access.c_str());
 			access_logged = now;
