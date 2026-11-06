@@ -66,6 +66,8 @@ static std::atomic<uint64_t> duplicator_failed_at{0};
 static std::atomic<int> hook_pipe_taken{0};
 /** When the app asked to stop the recording, while it hasn't stopped yet (os_gettime_ns; 0 = not stopping) */
 static std::atomic<uint64_t> stop_asked_at{0};
+/** How many recordings have started: a hung stop's follow-up only acts while it's still that recording (watch) */
+static std::atomic<uint64_t> recordings_started{0};
 
 static void log_handler(int level, const char *format, va_list args, void *)
 {
@@ -885,6 +887,7 @@ static std::string start_recording(const std::string &folder, const std::string 
 		const char *why = obs_output_get_last_error(rec.output);
 		return std::string("Recording didn't start") + (why ? std::string(": ") + why : "");
 	}
+	recordings_started++;
 	return "";
 }
 
@@ -1379,7 +1382,7 @@ static void watch()
 {
 	std::string last_access;
 	bool hook_taken_said = false;
-	uint64_t writers_ended_at = 0, stop_looked_at = 0;
+	uint64_t writers_ended_at = 0, stop_looked_at = 0, ended_recording = 0;
 	bool slow_stop_said = false;
 	uint64_t alone_since = 0;
 	bool finishing_alone = false;
@@ -1406,7 +1409,8 @@ static void watch()
 			// puts a yellow border around the screen while it records. Only for this setup (a new one tries the
 			// usual way again).
 			uint64_t failed = duplicator_failed_at;
-			if (rec.screen && !rec.screen_fallback && failed && now - failed >= 2000000000ULL && picture.state == 0) {
+			// (Set by the log handler on another thread, so it can be newer than `now`: then it waits for the next round)
+			if (rec.screen && !rec.screen_fallback && failed && failed <= now && now - failed >= 2000000000ULL && picture.state == 0) {
 				rec.screen_fallback = true;
 				blog(LOG_WARNING, "[recorder] screen capture: Windows refused the usual way of capturing the screen (DXGI, the "
 						  "\"Failed\" lines above), so it's captured with Windows Graphics Capture instead");
@@ -1442,8 +1446,12 @@ static void watch()
 		// Still writing or working, it's given more time; with no progress since the last look it's ended. With it
 		// ended, OBS reports the stop but can still count the output as running (checked with a frozen writer:
 		// "Already recording" next), so a few seconds later it's stopped outright.
+		// (A stop asked for after `now` was taken, while this round waited for obs_lock, is newer than `now`: it's looked
+		// at next round. Taken from `now` it came out as 18 billion seconds, and the writer was ended at once, cutting
+		// the video's last fragment: 2026-11-05 00:45)
 		uint64_t asked = stop_asked_at;
-		if (asked && now - asked >= STOP_STUCK_NS && now - stop_looked_at >= STOP_LOOK_NS) {
+		if (asked > now) blog(LOG_INFO, "[recorder] the stop came while the stop check was busy: it's looked at a second later");
+		if (asked && asked <= now && now - asked >= STOP_STUCK_NS && now - stop_looked_at >= STOP_LOOK_NS) {
 			stop_looked_at = now;
 			bool progressed = writers_progressed();
 			unsigned long long waited = (now - asked) / 1000000000ULL;
@@ -1457,6 +1465,7 @@ static void watch()
 				     progressed ? " (its file writer was still working, but that's the limit)" : " (no progress in the last 5 s)");
 				end_file_writers("stopping hung", true);
 				writers_ended_at = now;
+				ended_recording = recordings_started;
 			}
 		}
 		if (!asked)
@@ -1464,7 +1473,9 @@ static void watch()
 		if (writers_ended_at && now - writers_ended_at >= 3000000000ULL) {
 			writers_ended_at = 0;
 			std::lock_guard<std::mutex> lock(obs_lock);
-			if (recording_active()) {
+			// (Only the recording whose writer was ended: one started since, the next game, is left alone. Seen in a test
+			// that started again at once, 2026-11-06: the new recording was stopped 2 s in)
+			if (recording_active() && recordings_started == ended_recording) {
 				blog(LOG_WARNING, "[recorder] still recording after its file writer was ended: stopping it outright");
 				obs_output_force_stop(rec.output);
 			}
