@@ -25,7 +25,10 @@
 // Audio inputs carry the core's source "id" (for volume and levels) and a "volume" (1 = as it plays).
 //
 // Command line: league-recorder-obs.exe --pipe <name> --config <folder for logs and plugin settings>
+//                 [--install <League Recorder's folder>]
 // It lives in OBS's bin\64bit folder so libobs finds its data and plugins at ../../data and ../../obs-plugins.
+// --install is given by the administrator helper, which runs a checked copy of this folder from a place only
+// administrators can change (src-tauri admin_helper.rs); without it the install folder is three up from this exe.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -1759,6 +1762,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 			config = argv[++i];
 		else if (wcscmp(argv[i], L"--log") == 0)
 			log_path = argv[++i];
+		else if (wcscmp(argv[i], L"--install") == 0)
+			install_dir = argv[++i];
 	}
 	LocalFree(argv);
 	if (config.empty()) {
