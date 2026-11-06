@@ -14,7 +14,8 @@
 //       without Microsoft's AV1 Video Extension), so recordings still get thumbnails.
 //   league-recorder-media.exe pixels <in.mp4> <out.rgb> <x,y,w,h> <seconds,seconds,...>
 //       One area of the frame at each time, as raw RGB one after another: for reading the game's HUD
-//       (which abilities were ready) after a game.
+//       (which abilities were ready) after a game. Decoded on the graphics card where it can be (prints
+//       "decoder graphics card", or "decoder processor: <why>"); LR_MEDIA_CPU=1 keeps it on the processor.
 //
 // stdout: "progress <0-1>" lines while working, then "done"; on failure "error <message>" and exit code 1.
 
@@ -27,6 +28,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/audio_fifo.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
@@ -619,7 +621,75 @@ static void run_thumbnail(const std::string &in_path, const std::string &out_pat
 // before it every time (up to 2 s of video), even when the last time was a second earlier in the
 // same stretch; now it only seeks when a keyframe lies between the last frame and the next time,
 // so no frame is decoded twice. The frames picked are the same ones.
-static void run_pixels(const std::string &in_path, const std::string &out_path, int x, int y, int w, int h, const std::vector<double> &times)
+//
+// Decoded on the graphics card where it can be (D3D11VA: Windows' video decoding on any card, NVIDIA's,
+// AMD's or Intel's). On the processor, every frame up to each time is decoded on all its cores: about 30-50 s
+// of processor time a game at 1080p, 33 Mbit/s (measured 2026-11-06 on the owner's games). Only the frames
+// actually used are copied back from the card, and turned into the processor decoder's own layout before
+// they're made RGB, so the pixels come out the same either way (H.264, HEVC and AV1 decoding is exact).
+// Anything about the card that fails (no such decoder, a driver error mid-way) reads it all again on the
+// processor, as before.
+
+/** Something about decoding on the graphics card failed: read again on the processor */
+struct GpuFailure {
+	std::string message;
+};
+
+/** The graphics card's frames, if the decoder offers them (the get_format callback) */
+static AVPixelFormat pick_d3d11(AVCodecContext *, const AVPixelFormat *offered)
+{
+	for (const AVPixelFormat *f = offered; *f != AV_PIX_FMT_NONE; f++)
+		if (*f == AV_PIX_FMT_D3D11)
+			return *f;
+	return AV_PIX_FMT_NONE; // fails the decoding: read on the processor instead
+}
+
+/**
+ * A frame copied back from the card as the processor's decoder would have given it: NV12 (one plane of
+ * U and V side by side) as YUV420P, P010 (10-bit at the top of 16) as YUV420P10. Other layouts as they are.
+ */
+static void like_processor(const AVFrame *nv, AVFrame *out)
+{
+	av_frame_unref(out);
+	bool ten = nv->format == AV_PIX_FMT_P010LE;
+	out->format = ten ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+	out->width = nv->width;
+	out->height = nv->height;
+	check(av_frame_get_buffer(out, 0), "Couldn't convert the frame");
+	const int cw = (nv->width + 1) / 2, ch = (nv->height + 1) / 2;
+	for (int r = 0; r < nv->height; r++) {
+		if (ten) {
+			const uint16_t *from = (const uint16_t *)(nv->data[0] + (size_t)r * nv->linesize[0]);
+			uint16_t *to = (uint16_t *)(out->data[0] + (size_t)r * out->linesize[0]);
+			for (int c = 0; c < nv->width; c++)
+				to[c] = from[c] >> 6;
+		} else {
+			memcpy(out->data[0] + (size_t)r * out->linesize[0], nv->data[0] + (size_t)r * nv->linesize[0], nv->width);
+		}
+	}
+	for (int r = 0; r < ch; r++) {
+		if (ten) {
+			const uint16_t *uv = (const uint16_t *)(nv->data[1] + (size_t)r * nv->linesize[1]);
+			uint16_t *u = (uint16_t *)(out->data[1] + (size_t)r * out->linesize[1]);
+			uint16_t *v = (uint16_t *)(out->data[2] + (size_t)r * out->linesize[2]);
+			for (int c = 0; c < cw; c++) {
+				u[c] = uv[2 * c] >> 6;
+				v[c] = uv[2 * c + 1] >> 6;
+			}
+		} else {
+			const uint8_t *uv = nv->data[1] + (size_t)r * nv->linesize[1];
+			uint8_t *u = out->data[1] + (size_t)r * out->linesize[1];
+			uint8_t *v = out->data[2] + (size_t)r * out->linesize[2];
+			for (int c = 0; c < cw; c++) {
+				u[c] = uv[2 * c];
+				v[c] = uv[2 * c + 1];
+			}
+		}
+	}
+}
+
+/** The areas at each time, in the order asked (`gpu`: decoded on the graphics card, or a GpuFailure) */
+static std::vector<uint8_t> read_areas(const std::string &in_path, int x, int y, int w, int h, const std::vector<double> &times, bool gpu)
 {
 	Input in(in_path);
 	if (in.video < 0)
@@ -629,37 +699,66 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 		if ((int)i != in.video)
 			in.ctx->streams[i]->discard = AVDISCARD_ALL;
 
-	const AVCodec *codec = vs->codecpar->codec_id == AV_CODEC_ID_AV1 ? avcodec_find_decoder_by_name("libaom-av1") : nullptr;
+	// AV1 on the processor through libaom; on the card through FFmpeg's own AV1 decoder, which only decodes
+	// with the card's help
+	const bool av1 = vs->codecpar->codec_id == AV_CODEC_ID_AV1;
+	const AVCodec *codec = av1 ? avcodec_find_decoder_by_name(gpu ? "av1" : "libaom-av1") : nullptr;
 	if (!codec)
 		codec = avcodec_find_decoder(vs->codecpar->codec_id);
 	if (!codec)
 		throw Failure{"No decoder for this video"};
+	if (gpu) {
+		bool offered = false;
+		for (int i = 0;; i++) {
+			const AVCodecHWConfig *c = avcodec_get_hw_config(codec, i);
+			if (!c)
+				break;
+			if ((c->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) && c->device_type == AV_HWDEVICE_TYPE_D3D11VA)
+				offered = true;
+		}
+		if (!offered)
+			throw GpuFailure{std::string("the ") + codec->name + " decoder can't use the graphics card"};
+	}
 	AVCodecContext *dec = avcodec_alloc_context3(codec);
 	AVFrame *frame = av_frame_alloc(), *picked = av_frame_alloc(), *ahead = av_frame_alloc(), *rgb = av_frame_alloc();
+	AVFrame *copied = av_frame_alloc(), *planar = av_frame_alloc();
 	AVPacket *pkt = av_packet_alloc();
+	AVBufferRef *device = nullptr;
 	SwsContext *sws = nullptr;
-	FILE *file = nullptr;
 	auto cleanup = [&]() {
-		if (file)
-			fclose(file);
 		sws_freeContext(sws);
 		avcodec_free_context(&dec);
+		av_buffer_unref(&device);
 		av_frame_free(&frame);
 		av_frame_free(&picked);
 		av_frame_free(&ahead);
 		av_frame_free(&rgb);
+		av_frame_free(&copied);
+		av_frame_free(&planar);
 		av_packet_free(&pkt);
 	};
+	std::vector<uint8_t> areas;
 	try {
 		check(avcodec_parameters_to_context(dec, vs->codecpar), "Couldn't read the video");
 		dec->pkt_timebase = vs->time_base;
-		dec->thread_count = 0; // as many as the CPU has
-		check(avcodec_open2(dec, codec, nullptr), "Couldn't open the video decoder");
+		if (gpu) {
+			int r = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
+			if (r < 0)
+				throw GpuFailure{"the graphics card's video decoding couldn't be started: " + ff_error(r)};
+			dec->hw_device_ctx = av_buffer_ref(device);
+			dec->get_format = pick_d3d11;
+			// `picked` and `ahead` hold on to a frame each besides the ones the decoder keeps
+			dec->extra_hw_frames = 4;
+			dec->thread_count = 1;
+		} else {
+			dec->thread_count = 0; // as many as the CPU has
+		}
+		int opened = avcodec_open2(dec, codec, nullptr);
+		if (opened < 0 && gpu)
+			throw GpuFailure{"the decoder couldn't be opened for the graphics card: " + ff_error(opened)};
+		check(opened, "Couldn't open the video decoder");
 		if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > dec->width || y + h > dec->height)
 			throw Failure{"The area is outside the picture"};
-		file = _wfopen(wide(out_path).c_str(), L"wb");
-		if (!file)
-			throw Failure{"Couldn't write the pixels"};
 		const size_t row = (size_t)w * 3;
 
 		// The times in order (the HUD reader asks fight by fight, which can overlap); the areas are
@@ -668,7 +767,7 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 		for (size_t n = 0; n < order.size(); n++)
 			order[n] = n;
 		std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return times[a] < times[b]; });
-		std::vector<uint8_t> areas(times.size() * row * h);
+		areas.resize(times.size() * row * h);
 
 		// `picked`: the newest frame decoded at or before the time being read; `ahead`: the first one
 		// decoded after it, kept for the next time
@@ -684,6 +783,10 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 				int r = avcodec_receive_frame(dec, into);
 				if (r >= 0)
 					return true;
+				// On the processor a damaged stretch (the end of a recording cut short) just ends it here; on the
+				// card an error may be the card's, so it's read again on the processor
+				if (gpu && r != AVERROR(EAGAIN) && r != AVERROR_EOF)
+					throw GpuFailure{"decoding on the graphics card failed: " + ff_error(r)};
 				if (r != AVERROR(EAGAIN) || drained)
 					return false;
 				if (av_read_frame(in.ctx, pkt) < 0) {
@@ -695,7 +798,10 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 				if (pkt->stream_index == in.video) {
 					bool skippable = pkt->pts != AV_NOPTS_VALUE && latest != AV_NOPTS_VALUE && pkt->pts < latest;
 					dec->skip_frame = skippable ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
-					if (avcodec_send_packet(dec, pkt) >= 0 && pkt->pts != AV_NOPTS_VALUE) {
+					int sent = avcodec_send_packet(dec, pkt);
+					if (gpu && sent < 0 && sent != AVERROR(EAGAIN))
+						throw GpuFailure{"decoding on the graphics card failed: " + ff_error(sent)};
+					if (sent >= 0 && pkt->pts != AV_NOPTS_VALUE) {
 						if (pkt->pts <= target)
 							latest = latest == AV_NOPTS_VALUE ? pkt->pts : std::max(latest, pkt->pts);
 						else
@@ -759,33 +865,81 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 				have = true;
 				done = picked->best_effort_timestamp != AV_NOPTS_VALUE && picked->best_effort_timestamp >= target;
 			}
-			if (!have)
+			if (!have) {
+				if (gpu)
+					throw GpuFailure{"no frame came from the graphics card"};
 				throw Failure{"No frame could be decoded"};
+			}
+
+			// A frame on the card: copied back, in the processor decoder's layout
+			const AVFrame *source = picked;
+			if (picked->format == AV_PIX_FMT_D3D11) {
+				av_frame_unref(copied);
+				int r = av_hwframe_transfer_data(copied, picked, 0);
+				if (r < 0)
+					throw GpuFailure{"a frame couldn't be copied from the graphics card: " + ff_error(r)};
+				if (copied->format == AV_PIX_FMT_NV12 || copied->format == AV_PIX_FMT_P010LE) {
+					like_processor(copied, planar);
+					source = planar;
+				} else {
+					source = copied;
+				}
+			}
 
 			// The whole frame to RGB, then just the area's rows
-			sws = sws_getCachedContext(sws, picked->width, picked->height, (AVPixelFormat)picked->format, picked->width, picked->height,
+			sws = sws_getCachedContext(sws, source->width, source->height, (AVPixelFormat)source->format, source->width, source->height,
 						   AV_PIX_FMT_RGB24, SWS_POINT, nullptr, nullptr, nullptr);
 			if (!sws)
 				throw Failure{"Couldn't convert the frame"};
-			if (!rgb->data[0] || rgb->width != picked->width || rgb->height != picked->height) {
+			if (!rgb->data[0] || rgb->width != source->width || rgb->height != source->height) {
 				av_frame_unref(rgb);
 				rgb->format = AV_PIX_FMT_RGB24;
-				rgb->width = picked->width;
-				rgb->height = picked->height;
+				rgb->width = source->width;
+				rgb->height = source->height;
 				check(av_frame_get_buffer(rgb, 0), "Couldn't convert the frame");
 			}
-			sws_scale(sws, picked->data, picked->linesize, 0, picked->height, rgb->data, rgb->linesize);
+			sws_scale(sws, source->data, source->linesize, 0, source->height, rgb->data, rgb->linesize);
 			for (int r = 0; r < h; r++)
 				memcpy(&areas[(n * h + r) * row], rgb->data[0] + (size_t)(y + r) * rgb->linesize[0] + (size_t)x * 3, row);
 			say("progress " + std::to_string((double)(done_count + 1) / times.size()));
 		}
-		if (!areas.empty() && fwrite(areas.data(), 1, areas.size(), file) != areas.size())
-			throw Failure{"Couldn't write the pixels"};
 	} catch (...) {
 		cleanup();
 		throw;
 	}
 	cleanup();
+	return areas;
+}
+
+static void run_pixels(const std::string &in_path, const std::string &out_path, int x, int y, int w, int h, const std::vector<double> &times)
+{
+	FILE *file = _wfopen(wide(out_path).c_str(), L"wb");
+	if (!file)
+		throw Failure{"Couldn't write the pixels"};
+	std::vector<uint8_t> areas;
+	try {
+		const char *cpu = getenv("LR_MEDIA_CPU");
+		bool gpu = !(cpu && *cpu && strcmp(cpu, "0") != 0);
+		if (gpu) {
+			try {
+				areas = read_areas(in_path, x, y, w, h, times, true);
+				say("decoder graphics card");
+			} catch (const GpuFailure &f) {
+				say("decoder processor: " + f.message);
+				gpu = false;
+			}
+		} else {
+			say("decoder processor: LR_MEDIA_CPU is set");
+		}
+		if (!gpu)
+			areas = read_areas(in_path, x, y, w, h, times, false);
+		if (!areas.empty() && fwrite(areas.data(), 1, areas.size(), file) != areas.size())
+			throw Failure{"Couldn't write the pixels"};
+	} catch (...) {
+		fclose(file);
+		throw;
+	}
+	fclose(file);
 }
 
 int wmain()
