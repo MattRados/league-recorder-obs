@@ -12,6 +12,12 @@
 //   league-recorder-media.exe thumbnail <in.mp4> <out.jpg> <seconds> <width>
 //       The frame at <seconds> as a JPEG <width> pixels wide: for videos Windows can't decode (e.g. AV1
 //       without Microsoft's AV1 Video Extension), so recordings still get thumbnails.
+//   league-recorder-media.exe encode <in.mp4> <out.mp4> [from=<s>] [to=<s>] [height=<px>] [fps=<n>] kbps=<video kbps>
+//                             [akbps=<audio kbps>] [tracks=<n,n,...>] [separate=1] [fragmented=1]
+//       Part of the video encoded again as H.264 (the graphics card's encoder where there is one, prints "encoder <name>")
+//       and AAC: smaller (height, fps, bitrate) and/or cut to the exact frame. The listed audio tracks are mixed into
+//       one, or with separate=1 each kept as its own. fragmented=1 writes it the way the recordings are (a fragment at
+//       each keyframe), else with its index in front.
 //   league-recorder-media.exe pixels <in.mp4> <out.rgb> <x,y,w,h> <seconds,seconds,...>
 //       One area of the frame at each time, as raw RGB one after another: for reading the game's HUD
 //       (which abilities were ready) after a game. Decoded on the graphics card where it can be (prints
@@ -35,6 +41,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -505,6 +512,354 @@ static void run_export(const std::string &in_path, const std::string &out_path, 
 	avcodec_free_context(&enc);
 	av_frame_free(&frame);
 	av_packet_free(&pkt);
+}
+
+// ---------- encode: part of a video encoded again ----------
+//
+// For the Clip Vault: a copy small enough to paste into Discord (a lower bitrate, and smaller or fewer frames), and a
+// trim cut to the exact frame instead of the keyframe before it. H.264 on the graphics card where there's an encoder
+// for it (NVIDIA, AMD, Intel), else x264 on the processor; audio as AAC, the chosen tracks mixed into one or each kept.
+
+struct EncodeOptions {
+	double from = 0;           // seconds into the video
+	double to = 0;             // 0: to the end
+	int height = 0;            // 0: as it is (never made bigger)
+	double max_fps = 0;        // 0: as it is
+	int video_kbps = 0;
+	int audio_kbps = 128;
+	std::vector<int> tracks;   // audio tracks, by their order in the file
+	bool separate = false;     // each track kept as its own (else mixed into one)
+	bool fragmented = false;   // a fragment at every keyframe, like the recordings (else the index in front)
+};
+
+static const char *ENCODERS[] = {"h264_nvenc", "h264_amf", "h264_qsv", "libx264"};
+
+/** The first H.264 encoder that opens with these settings (LR_MEDIA_ENCODER picks one, for tests) */
+static AVCodecContext *open_video_encoder(int width, int height, AVRational time_base, AVRational fps, int kbps, bool global_header,
+					   std::string &name)
+{
+	char wanted[64] = {};
+	GetEnvironmentVariableA("LR_MEDIA_ENCODER", wanted, sizeof(wanted));
+	std::string tried;
+	for (const char *candidate : ENCODERS) {
+		if (wanted[0] && strcmp(wanted, candidate) != 0)
+			continue;
+		const AVCodec *codec = avcodec_find_encoder_by_name(candidate);
+		if (!codec)
+			continue;
+		AVPixelFormat format = AV_PIX_FMT_NONE;
+		for (const AVPixelFormat *f = codec->pix_fmts; f && *f != AV_PIX_FMT_NONE; f++)
+			if (*f == AV_PIX_FMT_YUV420P || (*f == AV_PIX_FMT_NV12 && format == AV_PIX_FMT_NONE))
+				format = *f;
+		if (format == AV_PIX_FMT_NONE)
+			continue;
+		AVCodecContext *enc = avcodec_alloc_context3(codec);
+		enc->width = width;
+		enc->height = height;
+		enc->pix_fmt = format;
+		enc->time_base = time_base;
+		enc->framerate = fps;
+		enc->bit_rate = (int64_t)kbps * 1000;
+		enc->rc_max_rate = enc->bit_rate;
+		enc->rc_buffer_size = (int)std::min<int64_t>(INT_MAX, enc->bit_rate * 2);
+		enc->gop_size = std::max(1, (int)(2 * av_q2d(fps) + 0.5));
+		if (global_header)
+			enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+		// No B-frames on the graphics card's encoders: their timestamps for them don't fit the MP4 muxer (NVENC gave
+		// "pts < dts")
+		if (strcmp(candidate, "libx264") != 0)
+			enc->max_b_frames = 0;
+		// A steady bitrate, so the file comes out the size it was asked for
+		if (!strcmp(candidate, "h264_nvenc")) {
+			av_opt_set(enc->priv_data, "preset", "p5", 0);
+			av_opt_set(enc->priv_data, "rc", "cbr", 0);
+		} else if (!strcmp(candidate, "h264_amf")) {
+			av_opt_set(enc->priv_data, "rc", "cbr", 0);
+			av_opt_set(enc->priv_data, "quality", "quality", 0);
+		} else if (!strcmp(candidate, "libx264")) {
+			av_opt_set(enc->priv_data, "preset", "faster", 0);
+		}
+		int r = avcodec_open2(enc, codec, nullptr);
+		if (r >= 0) {
+			name = candidate;
+			return enc;
+		}
+		tried += std::string(tried.empty() ? "" : "; ") + candidate + ": " + ff_error(r);
+		avcodec_free_context(&enc);
+	}
+	throw Failure{"No video encoder could start" + (tried.empty() ? std::string() : " (" + tried + ")")};
+}
+
+static AVCodecContext *open_aac(int kbps, bool global_header)
+{
+	const AVCodec *aac = avcodec_find_encoder(AV_CODEC_ID_AAC);
+	if (!aac)
+		throw Failure{"No AAC encoder"};
+	AVCodecContext *enc = avcodec_alloc_context3(aac);
+	av_channel_layout_default(&enc->ch_layout, 2);
+	enc->sample_rate = RATE;
+	enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+	enc->bit_rate = (int64_t)kbps * 1000;
+	enc->time_base = AVRational{1, RATE};
+	if (global_header)
+		enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+	check(avcodec_open2(enc, aac, nullptr), "Couldn't start the audio encoder");
+	return enc;
+}
+
+static void run_encode(const std::string &in_path, const std::string &out_path, const EncodeOptions &o)
+{
+	Input in(in_path);
+	if (in.video < 0)
+		throw Failure{"The file has no video"};
+	for (int n : o.tracks)
+		if (n < 0 || n >= (int)in.audio.size())
+			throw Failure{"There's no audio track " + std::to_string(n)};
+	AVStream *vs = in.ctx->streams[in.video];
+	double video_start = in.start(in.video);
+	double to = o.to > o.from ? o.to : (in.duration > 0 ? in.duration : 1e9);
+	AVRational tb = vs->time_base;
+
+	AVFormatContext *out = open_output(out_path, "mp4");
+	bool global_header = out->oformat->flags & AVFMT_GLOBALHEADER;
+	AVCodecContext *dec = nullptr, *venc = nullptr;
+	std::vector<AVCodecContext *> aencs;
+	std::vector<Track *> tracks;
+	SwsContext *sws = nullptr;
+	AVFrame *frame = av_frame_alloc(), *scaled = av_frame_alloc(), *audio = av_frame_alloc();
+	AVPacket *pkt = av_packet_alloc(), *got = av_packet_alloc();
+	try {
+		const AVCodec *codec = avcodec_find_decoder(vs->codecpar->codec_id);
+		if (!codec)
+			throw Failure{"No decoder for the video"};
+		dec = avcodec_alloc_context3(codec);
+		check(avcodec_parameters_to_context(dec, vs->codecpar), "Couldn't read the video");
+		dec->pkt_timebase = tb;
+		dec->thread_count = 0;
+		check(avcodec_open2(dec, codec, nullptr), "Couldn't open the video");
+
+		// The size and rate it's made at
+		int src_w = vs->codecpar->width, src_h = vs->codecpar->height;
+		int out_h = o.height > 0 && o.height < src_h ? o.height : src_h;
+		out_h &= ~1;
+		int out_w = (int)(src_w * (double)out_h / src_h / 2 + 0.5) * 2;
+		AVRational fps = av_guess_frame_rate(in.ctx, vs, nullptr);
+		if (fps.num <= 0 || fps.den <= 0)
+			fps = AVRational{60, 1};
+		bool fewer = o.max_fps > 0 && av_q2d(fps) > o.max_fps + 0.01;
+		if (fewer)
+			fps = av_d2q(o.max_fps, 1000);
+		std::string encoder;
+		venc = open_video_encoder(out_w, out_h, tb, fps, o.video_kbps, global_header, encoder);
+		say("encoder " + encoder);
+		AVStream *vout = avformat_new_stream(out, nullptr);
+		check(avcodec_parameters_from_context(vout->codecpar, venc), "Couldn't set up the video");
+		vout->time_base = tb;
+
+		// The audio: decoded tracks (Track, as the export mixes them), and an encoder for the mix or for each
+		for (int n : o.tracks) {
+			auto *t = new Track();
+			tracks.push_back(t);
+			t->stream = in.audio[n];
+			AVCodecParameters *par = in.ctx->streams[t->stream]->codecpar;
+			const AVCodec *ac = avcodec_find_decoder(par->codec_id);
+			if (!ac)
+				throw Failure{"No decoder for an audio track"};
+			t->dec = avcodec_alloc_context3(ac);
+			check(avcodec_parameters_to_context(t->dec, par), "Couldn't read an audio track");
+			t->dec->pkt_timebase = in.ctx->streams[t->stream]->time_base;
+			check(avcodec_open2(t->dec, ac, nullptr), "Couldn't open an audio track");
+		}
+		size_t outputs = tracks.empty() ? 0 : o.separate ? tracks.size() : 1;
+		std::vector<AVStream *> aouts;
+		for (size_t i = 0; i < outputs; i++) {
+			aencs.push_back(open_aac(o.audio_kbps, global_header));
+			AVStream *s = avformat_new_stream(out, nullptr);
+			check(avcodec_parameters_from_context(s->codecpar, aencs.back()), "Couldn't set up the audio");
+			s->time_base = AVRational{1, RATE};
+			aouts.push_back(s);
+		}
+		begin(out, out_path, o.fragmented ? "frag_keyframe+empty_moov+default_base_moof" : "+faststart");
+
+		for (unsigned i = 0; i < in.ctx->nb_streams; i++) {
+			bool used = (int)i == in.video || std::any_of(tracks.begin(), tracks.end(), [&](Track *t) { return t->stream == (int)i; });
+			if (!used)
+				in.ctx->streams[i]->discard = AVDISCARD_ALL;
+		}
+		// From the keyframe at or before the start: the frames before it are decoded and dropped
+		int64_t seek_to = (int64_t)((o.from + video_start) / av_q2d(tb));
+		if (o.from > 0)
+			av_seek_frame(in.ctx, in.video, seek_to, AVSEEK_FLAG_BACKWARD);
+
+		auto write = [&](AVCodecContext *enc, AVFrame *f, AVStream *s) {
+			check(avcodec_send_frame(enc, f), "Couldn't encode");
+			while (avcodec_receive_packet(enc, got) >= 0) {
+				got->stream_index = s->index;
+				av_packet_rescale_ts(got, enc->time_base, s->time_base);
+				check(av_interleaved_write_frame(out, got), "Couldn't write the output");
+			}
+		};
+
+		// The audio, in step with the video: every whole frame all tracks have reached up to `until` (48 kHz samples
+		// on the video's clock), or all of it at the end
+		int64_t s_first = (int64_t)llround((o.from + video_start) * RATE);
+		int64_t s_end = (int64_t)llround((to + video_start) * RATE);
+		int64_t s_next = s_first;
+		int size = aencs.empty() ? 1024 : (aencs[0]->frame_size > 0 ? aencs[0]->frame_size : 1024);
+		auto pump_audio = [&](int64_t until, bool all) {
+			while (!aencs.empty() && s_next < s_end) {
+				int64_t want = std::min(s_next + size, s_end);
+				if (!all) {
+					if (want > until)
+						return;
+					for (Track *t : tracks)
+						if (!t->ended && (t->next == AV_NOPTS_VALUE || t->next < want))
+							return;
+				}
+				int count = (int)(want - s_next);
+				for (size_t a = 0; a < aencs.size(); a++) {
+					av_frame_unref(audio);
+					audio->nb_samples = size;
+					audio->format = AV_SAMPLE_FMT_FLTP;
+					audio->sample_rate = RATE;
+					av_channel_layout_default(&audio->ch_layout, 2);
+					check(av_frame_get_buffer(audio, 0), "Couldn't make an audio frame");
+					for (int ch = 0; ch < 2; ch++) {
+						float *dst = reinterpret_cast<float *>(audio->data[ch]);
+						for (int i = 0; i < size; i++) {
+							float sum = 0;
+							if (i < count) {
+								if (o.separate)
+									sum = tracks[a]->take(s_next, size, ch, i);
+								else
+									for (Track *t : tracks)
+										sum += t->take(s_next, size, ch, i);
+							}
+							dst[i] = std::max(-1.0f, std::min(1.0f, sum));
+						}
+					}
+					audio->pts = s_next - s_first;
+					write(aencs[a], audio, aouts[a]);
+				}
+				s_next = want;
+				for (Track *t : tracks)
+					t->drop_before(s_next);
+			}
+		};
+
+		Progress progress{to - o.from};
+		double next_keep = -1e9;
+		int64_t last_pts = INT64_MIN;
+		auto take_frame = [&](AVFrame *f) {
+			int64_t pts = f->best_effort_timestamp;
+			if (pts == AV_NOPTS_VALUE)
+				return;
+			double t = pts * av_q2d(tb) - video_start;
+			if (t < o.from - 0.0005 || t >= to)
+				return;
+			// Fewer frames a second: one at most every 1/max_fps (with a little room for timestamps' jitter)
+			if (fewer) {
+				if (t < next_keep - 0.1 / o.max_fps)
+					return;
+				next_keep = std::max(next_keep, t) + 1 / o.max_fps;
+			}
+			sws = sws_getCachedContext(sws, f->width, f->height, (AVPixelFormat)f->format, out_w, out_h, venc->pix_fmt, SWS_BICUBIC, nullptr,
+						   nullptr, nullptr);
+			if (!sws)
+				throw Failure{"Couldn't set up the picture conversion"};
+			av_frame_unref(scaled);
+			scaled->format = venc->pix_fmt;
+			scaled->width = out_w;
+			scaled->height = out_h;
+			check(av_frame_get_buffer(scaled, 0), "Couldn't make a frame");
+			sws_scale(sws, f->data, f->linesize, 0, f->height, scaled->data, scaled->linesize);
+			int64_t out_pts = llround((t - o.from) / av_q2d(tb));
+			if (out_pts <= last_pts)
+				out_pts = last_pts + 1;
+			last_pts = out_pts;
+			scaled->pts = out_pts;
+			write(venc, scaled, vout);
+			progress.at(t - o.from);
+			pump_audio((int64_t)llround((t + video_start) * RATE), false);
+		};
+		auto drain_video = [&]() {
+			while (avcodec_receive_frame(dec, frame) >= 0) {
+				take_frame(frame);
+				av_frame_unref(frame);
+			}
+		};
+		auto drain_audio = [&](Track *t) {
+			while (avcodec_receive_frame(t->dec, frame) >= 0) {
+				t->push(frame, in.ctx->streams[t->stream]->time_base);
+				av_frame_unref(frame);
+			}
+		};
+
+		while (av_read_frame(in.ctx, pkt) >= 0) {
+			AVStream *src = in.ctx->streams[pkt->stream_index];
+			int64_t ts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+			bool past = ts != AV_NOPTS_VALUE && ts * av_q2d(src->time_base) - video_start > to + 2;
+			if (pkt->stream_index == in.video) {
+				if (past) {
+					av_packet_unref(pkt);
+					break;
+				}
+				// A broken packet is skipped rather than failing the whole copy
+				if (avcodec_send_packet(dec, pkt) >= 0)
+					drain_video();
+			} else if (!past) {
+				for (Track *t : tracks)
+					if (t->stream == pkt->stream_index && avcodec_send_packet(t->dec, pkt) >= 0)
+						drain_audio(t);
+			}
+			av_packet_unref(pkt);
+		}
+		avcodec_send_packet(dec, nullptr);
+		drain_video();
+		write(venc, nullptr, vout);
+		for (Track *t : tracks) {
+			avcodec_send_packet(t->dec, nullptr);
+			drain_audio(t);
+			t->ended = true;
+		}
+		// The audio ends with the last frame kept
+		if (last_pts != INT64_MIN)
+			s_end = std::min(s_end, (int64_t)llround((o.from + last_pts * av_q2d(tb) + 1 / av_q2d(fps) + video_start) * RATE));
+		pump_audio(s_end, true);
+		for (size_t a = 0; a < aencs.size(); a++)
+			write(aencs[a], nullptr, aouts[a]);
+		if (last_pts == INT64_MIN)
+			throw Failure{"There's no video in that part"};
+		finish(out);
+	} catch (...) {
+		finish(out);
+		DeleteFileW(wide(out_path).c_str());
+		for (Track *t : tracks)
+			delete t;
+		for (AVCodecContext *&a : aencs)
+			avcodec_free_context(&a);
+		avcodec_free_context(&venc);
+		avcodec_free_context(&dec);
+		sws_freeContext(sws);
+		av_frame_free(&frame);
+		av_frame_free(&scaled);
+		av_frame_free(&audio);
+		av_packet_free(&pkt);
+		av_packet_free(&got);
+		throw;
+	}
+	for (Track *t : tracks)
+		delete t;
+	for (AVCodecContext *&a : aencs)
+		avcodec_free_context(&a);
+	avcodec_free_context(&venc);
+	avcodec_free_context(&dec);
+	sws_freeContext(sws);
+	av_frame_free(&frame);
+	av_frame_free(&scaled);
+	av_frame_free(&audio);
+	av_packet_free(&pkt);
+	av_packet_free(&got);
 }
 
 // ---------- thumbnail: one frame as a JPEG ----------
@@ -988,6 +1343,44 @@ int wmain()
 				from = comma + 1;
 			}
 			run_export(args[1], args[2], chosen);
+		} else if (args.size() >= 4 && args[0] == "encode") {
+			EncodeOptions o;
+			for (size_t i = 3; i < args.size(); i++) {
+				size_t eq = args[i].find('=');
+				std::string key = args[i].substr(0, eq), value = eq == std::string::npos ? "" : args[i].substr(eq + 1);
+				if (key == "from")
+					o.from = std::max(0.0, atof(value.c_str()));
+				else if (key == "to")
+					o.to = atof(value.c_str());
+				else if (key == "height")
+					o.height = atoi(value.c_str());
+				else if (key == "fps")
+					o.max_fps = atof(value.c_str());
+				else if (key == "kbps")
+					o.video_kbps = atoi(value.c_str());
+				else if (key == "akbps")
+					o.audio_kbps = std::max(32, atoi(value.c_str()));
+				else if (key == "separate")
+					o.separate = value == "1";
+				else if (key == "fragmented")
+					o.fragmented = value == "1";
+				else if (key == "tracks") {
+					size_t from = 0;
+					while (from < value.size()) {
+						size_t comma = value.find(',', from);
+						std::string part = value.substr(from, comma == std::string::npos ? std::string::npos : comma - from);
+						if (!part.empty())
+							o.tracks.push_back(atoi(part.c_str()));
+						if (comma == std::string::npos)
+							break;
+						from = comma + 1;
+					}
+				} else
+					throw Failure{"Unknown encode setting: " + args[i]};
+			}
+			if (o.video_kbps < 50)
+				throw Failure{"encode needs kbps= (the video's bitrate)"};
+			run_encode(args[1], args[2], o);
 		} else {
 			say("error usage: tracks <in> <folder> <prefix> | export <in> <out> <n,n,...> | thumbnail <in> <out.jpg> <seconds> <width> | pixels <in> <out.rgb> <x,y,w,h> <seconds,...>");
 			return 1;
