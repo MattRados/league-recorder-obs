@@ -18,9 +18,10 @@
 //       and AAC: smaller (height, fps, bitrate) and/or cut to the exact frame. The listed audio tracks are mixed into
 //       one, or with separate=1 each kept as its own. fragmented=1 writes it the way the recordings are (a fragment at
 //       each keyframe), else with its index in front.
-//   league-recorder-media.exe pixels <in.mp4> <out.rgb> <x,y,w,h> <seconds,seconds,...>
-//       One area of the frame at each time, as raw RGB one after another: for reading the game's HUD
-//       (which abilities were ready) after a game. Decoded on the graphics card where it can be (prints
+//   league-recorder-media.exe pixels <in.mp4> <out.rgb> <x,y,w,h[;x,y,w,h...]> <seconds,seconds,...> [keyframes]
+//       One or more areas of the frame at each time, as raw RGB one after another (each area's times, then the
+//       next area's): for reading the game's HUD (which abilities were ready) after a game. With keyframes, each
+//       time is read at the keyframe at or before it, decoded on its own (prints "keyframe <n> <seconds>"). Decoded on the graphics card where it can be (prints
 //       "decoder graphics card", or "decoder processor: <why>"); LR_MEDIA_CPU=1 keeps it on the processor.
 //
 // stdout: "progress <0-1>" lines while working, then "done"; on failure "error <message>" and exit code 1.
@@ -36,6 +37,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
@@ -999,20 +1001,60 @@ static AVPixelFormat pick_d3d11(AVCodecContext *, const AVPixelFormat *offered)
 	return AV_PIX_FMT_NONE; // fails the decoding: read on the processor instead
 }
 
+/** A part of the picture to cut out of each frame */
+struct Area {
+	int x, y, w, h;
+};
+
+/**
+ * The rows of a frame the areas are in, from `top` to `bottom`, started on a row where the colour planes start
+ * a row too (even rows in 4:2:0), so only those rows are made RGB and come out exactly as from the whole frame.
+ * `shift`: how much smaller each plane's rows are (the colour planes of 4:2:0 have half as many).
+ */
+struct Band {
+	int top = 0, bottom = 0;
+	int shift[4] = {};
+};
+
+static Band band_of(const AVFrame *frame, const std::vector<Area> &cuts)
+{
+	Band band;
+	band.bottom = frame->height;
+	const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get((AVPixelFormat)frame->format);
+	// A layout whose rows can't be told apart this way: the whole frame
+	if (!desc || (desc->flags & (AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BITSTREAM)))
+		return band;
+	const int step = 1 << desc->log2_chroma_h;
+	int top = frame->height, bottom = 0;
+	for (const Area &c : cuts) {
+		top = std::min(top, c.y);
+		bottom = std::max(bottom, c.y + c.h);
+	}
+	band.top = top - top % step;
+	band.bottom = std::min(frame->height, (bottom + step - 1) / step * step);
+	band.shift[1] = band.shift[2] = desc->log2_chroma_h;
+	return band;
+}
+
 /**
  * A frame copied back from the card as the processor's decoder would have given it: NV12 (one plane of
  * U and V side by side) as YUV420P, P010 (10-bit at the top of 16) as YUV420P10. Other layouts as they are.
+ * Only rows `top` to `bottom` (`top` even) are filled in: the rest are never read.
  */
-static void like_processor(const AVFrame *nv, AVFrame *out)
+static void like_processor(const AVFrame *nv, AVFrame *out, int top, int bottom)
 {
-	av_frame_unref(out);
 	bool ten = nv->format == AV_PIX_FMT_P010LE;
-	out->format = ten ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
-	out->width = nv->width;
-	out->height = nv->height;
-	check(av_frame_get_buffer(out, 0), "Couldn't convert the frame");
-	const int cw = (nv->width + 1) / 2, ch = (nv->height + 1) / 2;
-	for (int r = 0; r < nv->height; r++) {
+	const int format = ten ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+	// The same frame's buffer for every frame of the same size
+	if (!out->data[0] || out->format != format || out->width != nv->width || out->height != nv->height) {
+		av_frame_unref(out);
+		out->format = format;
+		out->width = nv->width;
+		out->height = nv->height;
+		check(av_frame_get_buffer(out, 0), "Couldn't convert the frame");
+	}
+	const int cw = (nv->width + 1) / 2, ch = std::min((nv->height + 1) / 2, (bottom + 1) / 2);
+	for (int r = top; r < bottom; r++) {
 		if (ten) {
 			const uint16_t *from = (const uint16_t *)(nv->data[0] + (size_t)r * nv->linesize[0]);
 			uint16_t *to = (uint16_t *)(out->data[0] + (size_t)r * out->linesize[0]);
@@ -1022,7 +1064,7 @@ static void like_processor(const AVFrame *nv, AVFrame *out)
 			memcpy(out->data[0] + (size_t)r * out->linesize[0], nv->data[0] + (size_t)r * nv->linesize[0], nv->width);
 		}
 	}
-	for (int r = 0; r < ch; r++) {
+	for (int r = top / 2; r < ch; r++) {
 		if (ten) {
 			const uint16_t *uv = (const uint16_t *)(nv->data[1] + (size_t)r * nv->linesize[1]);
 			uint16_t *u = (uint16_t *)(out->data[1] + (size_t)r * out->linesize[1]);
@@ -1043,8 +1085,14 @@ static void like_processor(const AVFrame *nv, AVFrame *out)
 	}
 }
 
-/** The areas at each time, in the order asked (`gpu`: decoded on the graphics card, or a GpuFailure) */
-static std::vector<uint8_t> read_areas(const std::string &in_path, int x, int y, int w, int h, const std::vector<double> &times, bool gpu)
+/**
+ * The areas at each time, in the order asked (`gpu`: decoded on the graphics card, or a GpuFailure). Several
+ * areas come from the same decoded frames: decoding is nearly all the work, so reading your abilities and your
+ * teammates' frames together costs about what one of them did. They're written one area after another (all of
+ * the first area's times, then the second's), so one area comes out exactly as it did before.
+ */
+static std::vector<uint8_t> read_areas(const std::string &in_path, const std::vector<Area> &cuts, const std::vector<double> &times, bool keyframes,
+				       bool gpu)
 {
 	Input in(in_path);
 	if (in.video < 0)
@@ -1112,9 +1160,16 @@ static std::vector<uint8_t> read_areas(const std::string &in_path, int x, int y,
 		if (opened < 0 && gpu)
 			throw GpuFailure{"the decoder couldn't be opened for the graphics card: " + ff_error(opened)};
 		check(opened, "Couldn't open the video decoder");
-		if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > dec->width || y + h > dec->height)
-			throw Failure{"The area is outside the picture"};
-		const size_t row = (size_t)w * 3;
+		// Where each area's block starts in the output
+		std::vector<size_t> base(cuts.size());
+		size_t total = 0;
+		for (size_t a = 0; a < cuts.size(); a++) {
+			const Area &c = cuts[a];
+			if (c.x < 0 || c.y < 0 || c.w <= 0 || c.h <= 0 || c.x + c.w > dec->width || c.y + c.h > dec->height)
+				throw Failure{"The area is outside the picture"};
+			base[a] = total;
+			total += times.size() * (size_t)c.w * 3 * c.h;
+		}
 
 		// The times in order (the HUD reader asks fight by fight, which can overlap); the areas are
 		// written out in the order asked
@@ -1122,7 +1177,7 @@ static std::vector<uint8_t> read_areas(const std::string &in_path, int x, int y,
 		for (size_t n = 0; n < order.size(); n++)
 			order[n] = n;
 		std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return times[a] < times[b]; });
-		areas.resize(times.size() * row * h);
+		areas.resize(total);
 
 		// `picked`: the newest frame decoded at or before the time being read; `ahead`: the first one
 		// decoded after it, kept for the next time
@@ -1172,53 +1227,85 @@ static std::vector<uint8_t> read_areas(const std::string &in_path, int x, int y,
 			size_t n = order[done_count];
 			target = start + (int64_t)(times[n] / av_q2d(vs->time_base));
 
-			// Jump only if a keyframe lies after the frame we're at, on the way to the target: decoding
-			// from there is shorter. Without a keyframe list, jump for gaps over 2 s
-			bool seek = !have || picked->best_effort_timestamp == AV_NOPTS_VALUE;
-			if (!seek) {
-				int64_t at = picked->best_effort_timestamp;
-				const AVIndexEntry *key = avformat_index_get_entry_from_timestamp(vs, target, AVSEEK_FLAG_BACKWARD);
-				seek = key ? key->timestamp > at : (target - at) * av_q2d(vs->time_base) > 2;
-			}
-			if (seek) {
+			if (keyframes) {
+				// Just the keyframe at or before the time: one picture decoded on its own, nothing before or after
+				// it read (the recordings have one every 2 s, so reading a whole game this way decodes about a 120th
+				// of its frames)
 				avcodec_flush_buffers(dec);
-				av_seek_frame(in.ctx, in.video, target, AVSEEK_FLAG_BACKWARD);
 				av_frame_unref(picked);
-				av_frame_unref(ahead);
-				have = have_ahead = drained = false;
-				latest = AV_NOPTS_VALUE;
-				later.clear();
-			}
-			// Times sent earlier that this target has reached
-			for (size_t i = 0; i < later.size();) {
-				if (later[i] <= target) {
-					latest = latest == AV_NOPTS_VALUE ? later[i] : std::max(latest, later[i]);
-					later.erase(later.begin() + i);
-				} else {
-					i++;
+				have = false;
+				if (av_seek_frame(in.ctx, in.video, target, AVSEEK_FLAG_BACKWARD) >= 0) {
+					while (av_read_frame(in.ctx, pkt) >= 0) {
+						if (pkt->stream_index != in.video || !(pkt->flags & AV_PKT_FLAG_KEY)) {
+							av_packet_unref(pkt);
+							continue;
+						}
+						dec->skip_frame = AVDISCARD_DEFAULT;
+						int sent = avcodec_send_packet(dec, pkt);
+						av_packet_unref(pkt);
+						if (gpu && sent < 0)
+							throw GpuFailure{"decoding on the graphics card failed: " + ff_error(sent)};
+						// Out at once, not after the frames that would follow it
+						avcodec_send_packet(dec, nullptr);
+						int got = avcodec_receive_frame(dec, picked);
+						if (gpu && got < 0 && got != AVERROR_EOF)
+							throw GpuFailure{"decoding on the graphics card failed: " + ff_error(got)};
+						have = got >= 0;
+						break;
+					}
 				}
-			}
+				if (have && picked->best_effort_timestamp != AV_NOPTS_VALUE)
+					say("keyframe " + std::to_string(n) + " " + std::to_string((picked->best_effort_timestamp - start) * av_q2d(vs->time_base)));
+			} else {
 
-			// Forward to the target: the first frame after a jump is taken whatever its time; after
-			// that, frames up to the target, stopping at one past it
-			bool done = have && picked->best_effort_timestamp != AV_NOPTS_VALUE && picked->best_effort_timestamp >= target;
-			while (!done) {
-				if (have_ahead) {
-					av_frame_unref(frame);
-					av_frame_move_ref(frame, ahead);
-					have_ahead = false;
-				} else if (!next(frame)) {
-					break; // past the end: keep the last frame decoded
+				// Jump only if a keyframe lies after the frame we're at, on the way to the target: decoding
+				// from there is shorter. Without a keyframe list, jump for gaps over 2 s
+				bool seek = !have || picked->best_effort_timestamp == AV_NOPTS_VALUE;
+				if (!seek) {
+					int64_t at = picked->best_effort_timestamp;
+					const AVIndexEntry *key = avformat_index_get_entry_from_timestamp(vs, target, AVSEEK_FLAG_BACKWARD);
+					seek = key ? key->timestamp > at : (target - at) * av_q2d(vs->time_base) > 2;
 				}
-				if (have && frame->best_effort_timestamp != AV_NOPTS_VALUE && frame->best_effort_timestamp > target) {
-					av_frame_move_ref(ahead, frame);
-					have_ahead = true;
-					break;
+				if (seek) {
+					avcodec_flush_buffers(dec);
+					av_seek_frame(in.ctx, in.video, target, AVSEEK_FLAG_BACKWARD);
+					av_frame_unref(picked);
+					av_frame_unref(ahead);
+					have = have_ahead = drained = false;
+					latest = AV_NOPTS_VALUE;
+					later.clear();
 				}
-				av_frame_unref(picked);
-				av_frame_move_ref(picked, frame);
-				have = true;
-				done = picked->best_effort_timestamp != AV_NOPTS_VALUE && picked->best_effort_timestamp >= target;
+				// Times sent earlier that this target has reached
+				for (size_t i = 0; i < later.size();) {
+					if (later[i] <= target) {
+						latest = latest == AV_NOPTS_VALUE ? later[i] : std::max(latest, later[i]);
+						later.erase(later.begin() + i);
+					} else {
+						i++;
+					}
+				}
+
+				// Forward to the target: the first frame after a jump is taken whatever its time; after
+				// that, frames up to the target, stopping at one past it
+				bool done = have && picked->best_effort_timestamp != AV_NOPTS_VALUE && picked->best_effort_timestamp >= target;
+				while (!done) {
+					if (have_ahead) {
+						av_frame_unref(frame);
+						av_frame_move_ref(frame, ahead);
+						have_ahead = false;
+					} else if (!next(frame)) {
+						break; // past the end: keep the last frame decoded
+					}
+					if (have && frame->best_effort_timestamp != AV_NOPTS_VALUE && frame->best_effort_timestamp > target) {
+						av_frame_move_ref(ahead, frame);
+						have_ahead = true;
+						break;
+					}
+					av_frame_unref(picked);
+					av_frame_move_ref(picked, frame);
+					have = true;
+					done = picked->best_effort_timestamp != AV_NOPTS_VALUE && picked->best_effort_timestamp >= target;
+				}
 			}
 			if (!have) {
 				if (gpu)
@@ -1234,28 +1321,40 @@ static std::vector<uint8_t> read_areas(const std::string &in_path, int x, int y,
 				if (r < 0)
 					throw GpuFailure{"a frame couldn't be copied from the graphics card: " + ff_error(r)};
 				if (copied->format == AV_PIX_FMT_NV12 || copied->format == AV_PIX_FMT_P010LE) {
-					like_processor(copied, planar);
+					const Band band = band_of(copied, cuts);
+					like_processor(copied, planar, band.top, band.bottom);
 					source = planar;
 				} else {
 					source = copied;
 				}
 			}
 
-			// The whole frame to RGB, then just the area's rows
-			sws = sws_getCachedContext(sws, source->width, source->height, (AVPixelFormat)source->format, source->width, source->height,
-						   AV_PIX_FMT_RGB24, SWS_POINT, nullptr, nullptr, nullptr);
+			// Only the rows the areas are in to RGB (the HUD's strips are a tenth of the picture), then the areas
+			// out of them
+			const Band band = band_of(source, cuts);
+			const uint8_t *from[4] = {};
+			for (int p = 0; p < 4 && source->data[p]; p++)
+				from[p] = source->data[p] + (size_t)(band.top >> band.shift[p]) * source->linesize[p];
+			const int rows = band.bottom - band.top;
+			sws = sws_getCachedContext(sws, source->width, rows, (AVPixelFormat)source->format, source->width, rows, AV_PIX_FMT_RGB24, SWS_POINT,
+						   nullptr, nullptr, nullptr);
 			if (!sws)
 				throw Failure{"Couldn't convert the frame"};
-			if (!rgb->data[0] || rgb->width != source->width || rgb->height != source->height) {
+			if (!rgb->data[0] || rgb->width != source->width || rgb->height != rows) {
 				av_frame_unref(rgb);
 				rgb->format = AV_PIX_FMT_RGB24;
 				rgb->width = source->width;
-				rgb->height = source->height;
+				rgb->height = rows;
 				check(av_frame_get_buffer(rgb, 0), "Couldn't convert the frame");
 			}
-			sws_scale(sws, source->data, source->linesize, 0, source->height, rgb->data, rgb->linesize);
-			for (int r = 0; r < h; r++)
-				memcpy(&areas[(n * h + r) * row], rgb->data[0] + (size_t)(y + r) * rgb->linesize[0] + (size_t)x * 3, row);
+			sws_scale(sws, from, source->linesize, 0, rows, rgb->data, rgb->linesize);
+			for (size_t a = 0; a < cuts.size(); a++) {
+				const Area &c = cuts[a];
+				const size_t row = (size_t)c.w * 3;
+				for (int r = 0; r < c.h; r++)
+					memcpy(&areas[base[a] + (n * c.h + r) * row], rgb->data[0] + (size_t)(c.y - band.top + r) * rgb->linesize[0] + (size_t)c.x * 3,
+					       row);
+			}
 			say("progress " + std::to_string((double)(done_count + 1) / times.size()));
 		}
 	} catch (...) {
@@ -1266,7 +1365,8 @@ static std::vector<uint8_t> read_areas(const std::string &in_path, int x, int y,
 	return areas;
 }
 
-static void run_pixels(const std::string &in_path, const std::string &out_path, int x, int y, int w, int h, const std::vector<double> &times)
+static void run_pixels(const std::string &in_path, const std::string &out_path, const std::vector<Area> &cuts, const std::vector<double> &times,
+		       bool keyframes)
 {
 	FILE *file = _wfopen(wide(out_path).c_str(), L"wb");
 	if (!file)
@@ -1277,7 +1377,7 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 		bool gpu = !(cpu && *cpu && strcmp(cpu, "0") != 0);
 		if (gpu) {
 			try {
-				areas = read_areas(in_path, x, y, w, h, times, true);
+				areas = read_areas(in_path, cuts, times, keyframes, true);
 				say("decoder graphics card");
 			} catch (const GpuFailure &f) {
 				say("decoder processor: " + f.message);
@@ -1287,7 +1387,7 @@ static void run_pixels(const std::string &in_path, const std::string &out_path, 
 			say("decoder processor: LR_MEDIA_CPU is set");
 		}
 		if (!gpu)
-			areas = read_areas(in_path, x, y, w, h, times, false);
+			areas = read_areas(in_path, cuts, times, keyframes, false);
 		if (!areas.empty() && fwrite(areas.data(), 1, areas.size(), file) != areas.size())
 			throw Failure{"Couldn't write the pixels"};
 	} catch (...) {
@@ -1311,7 +1411,7 @@ int wmain()
 			run_tracks(args[1], args[2], args[3]);
 		} else if (args.size() == 5 && args[0] == "thumbnail") {
 			run_thumbnail(args[1], args[2], atof(args[3].c_str()), std::max(16, atoi(args[4].c_str())));
-		} else if (args.size() == 5 && args[0] == "pixels") {
+		} else if ((args.size() == 5 || (args.size() == 6 && args[5] == "keyframes")) && args[0] == "pixels") {
 			auto numbers = [](const std::string &list) {
 				std::vector<double> out;
 				size_t from = 0;
@@ -1326,10 +1426,25 @@ int wmain()
 				}
 				return out;
 			};
-			std::vector<double> area = numbers(args[3]);
-			if (area.size() != 4)
+			// One area "x,y,w,h", or several "x,y,w,h;x,y,w,h"
+			std::vector<Area> cuts;
+			size_t from = 0;
+			while (from <= args[3].size()) {
+				size_t semi = args[3].find(';', from);
+				std::string part = args[3].substr(from, semi == std::string::npos ? std::string::npos : semi - from);
+				if (!part.empty()) {
+					std::vector<double> area = numbers(part);
+					if (area.size() != 4)
+						throw Failure{"Each area must be x,y,w,h"};
+					cuts.push_back({(int)area[0], (int)area[1], (int)area[2], (int)area[3]});
+				}
+				if (semi == std::string::npos)
+					break;
+				from = semi + 1;
+			}
+			if (cuts.empty())
 				throw Failure{"The area must be x,y,w,h"};
-			run_pixels(args[1], args[2], (int)area[0], (int)area[1], (int)area[2], (int)area[3], numbers(args[4]));
+			run_pixels(args[1], args[2], cuts, numbers(args[4]), args.size() == 6);
 		} else if (args.size() == 4 && args[0] == "export") {
 			std::vector<int> chosen;
 			size_t from = 0;
